@@ -27,6 +27,17 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Drawing
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class PreviewWindow {
+            [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
+            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out Rect r);
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+          }
+          '@
+          New-Item -ItemType Directory -Path ui-check -Force | Out-Null
           foreach ($line in Get-Content package/SHA256SUMS.txt) {
             $parts = $line -split '  ', 2
             if ($parts.Length -ne 2 -or $parts[1] -notin @('LICENSE', 'HdobbyDesk-windows-x64-preview.zip', 'HdobbyDesk-windows-x64.exe')) { throw 'Unexpected checksum entry' }
@@ -34,7 +45,7 @@ jobs:
             if ($actual -ne $parts[0]) { throw "Checksum mismatch: $($parts[1])" }
           }
           Expand-Archive package/HdobbyDesk-windows-x64-preview.zip unpacked
-          function Assert-AppWindow([string]$launcher, [string]$expectedPath) {
+          function Assert-AppWindow([string]$launcher, [string]$expectedPath, [string]$captureName) {
             $launcher = (Resolve-Path $launcher).Path
             $parent = Start-Process $launcher -WorkingDirectory (Split-Path $launcher) -PassThru
             $found = $null
@@ -48,6 +59,19 @@ jobs:
               Start-Sleep -Seconds 10
               $found.Refresh()
               if ($found.HasExited) { throw 'Distributed application exited after launch' }
+              [PreviewWindow]::SetForegroundWindow($found.MainWindowHandle) | Out-Null
+              Start-Sleep -Seconds 2
+              $rect = New-Object PreviewWindow+Rect
+              if (![PreviewWindow]::GetWindowRect($found.MainWindowHandle, [ref]$rect)) { throw 'Cannot read application window bounds' }
+              $bitmap = New-Object System.Drawing.Bitmap(($rect.Right - $rect.Left), ($rect.Bottom - $rect.Top))
+              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+              try {
+                $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
+                $bitmap.Save((Join-Path (Resolve-Path ui-check) $captureName), [System.Drawing.Imaging.ImageFormat]::Png)
+              } finally {
+                $graphics.Dispose()
+                $bitmap.Dispose()
+              }
               Write-Output 'Distributed package window and startup stability check passed.'
             } finally {
               Get-Process hdobbydesk -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $expectedPath } | Stop-Process
@@ -56,7 +80,13 @@ jobs:
             }
           }
           $zipExe = (Resolve-Path unpacked/hdobbydesk.exe).Path
-          Assert-AppWindow $zipExe $zipExe
+          Assert-AppWindow $zipExe $zipExe 'zip-ui.png'
           $portableExe = Join-Path $env:LOCALAPPDATA 'hdobbydesk/hdobbydesk.exe'
-          Assert-AppWindow package/HdobbyDesk-windows-x64.exe $portableExe
+          Assert-AppWindow package/HdobbyDesk-windows-x64.exe $portableExe 'portable-ui.png'
           'Package checksums, extracted ZIP launch, portable EXE extraction and launch: PASS' | Out-File $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-package-ui-check
+          path: ui-check/
+          if-no-files-found: error
+          retention-days: 3
