@@ -77,12 +77,13 @@ jobs:
           $hashes | ForEach-Object { "$($_.Hash.ToLower())  $([System.IO.Path]::GetFileName($_.Path))" } | Set-Content package/SHA256SUMS.txt
           function Assert-AppWindow([string]$launcher, [string]$expectedPath, [string]$captureName) {
             $launcher = (Resolve-Path $launcher).Path
+            $expectedPath = [System.IO.Path]::GetFullPath($expectedPath)
             $parent = Start-Process $launcher -WorkingDirectory (Split-Path $launcher) -PassThru
             $found = $null
             try {
               for ($attempt = 0; $attempt -lt 45; $attempt++) {
                 Start-Sleep -Seconds 1
-                $found = Get-Process hdobbydesk -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $expectedPath -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+                $found = Get-Process hdobbydesk -ErrorAction SilentlyContinue | Where-Object { $_.Path -and [System.IO.Path]::GetFullPath($_.Path) -eq $expectedPath -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
                 if ($found) { break }
               }
               if (!$found) {
@@ -112,7 +113,7 @@ jobs:
               }
               Write-Output 'Distributed package window and startup stability check passed.'
             } finally {
-              $ownedIds = @(Get-Process hdobbydesk -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $expectedPath } | Select-Object -ExpandProperty Id)
+              $ownedIds = @(Get-Process hdobbydesk -ErrorAction SilentlyContinue | Where-Object { $_.Path -and [System.IO.Path]::GetFullPath($_.Path) -eq $expectedPath } | Select-Object -ExpandProperty Id)
               foreach ($ownedId in $ownedIds) {
                 Stop-Process -Id $ownedId -Force -ErrorAction SilentlyContinue
               }
