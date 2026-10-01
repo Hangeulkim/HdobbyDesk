@@ -58,6 +58,24 @@ python3 scripts/apply_private_network.py --apply
 
 네이티브 코어는 Rust/Cargo와 대상 OS의 C/C++ 도구, Flutter UI는 Flutter SDK와 대상 OS SDK가 필요합니다. Windows는 Windows 빌드 도구, macOS/iOS 전체 앱 빌드는 Xcode, Android는 Android SDK/NDK가 필요합니다. 현재 저장소의 전체 빌드 워크플로는 원본에서 가져온 것으로, HdobbyDesk 이름·패치 적용·서명·패키징까지 검증한 자동 릴리스 절차가 아닙니다. 기존 시험 앱을 복사하는 방식도 깨끗한 환경에서의 전체 빌드 검증을 대신하지 않습니다.
 
+Rust–Dart 연결 코드는 생성 파일이므로 소스를 받은 뒤 생성해야 합니다. macOS의 새 체크아웃에서 Flutter 3.24.5 / Dart 3.5.4, Rust 1.81.0, `flutter_rust_bridge_codegen` 1.80.1을 사용해 아래 생성 절차를 확인했습니다. `cargo-expand`와 libclang도 필요합니다. 도구 버전 확인과 연결 코드 생성 성공은 전체 앱 패키지 빌드 성공을 뜻하지 않습니다.
+
+```sh
+cargo install cargo-expand --version 1.0.95 --locked
+cargo install flutter_rust_bridge_codegen --version 1.80.1 --locked
+cd flutter
+flutter pub get
+cd ..
+RUST_LOG=info flutter_rust_bridge_codegen \
+  --rust-input src/flutter_ffi.rs \
+  --dart-output flutter/lib/generated_bridge.dart \
+  --c-output flutter/macos/Runner/bridge_generated.h \
+  --llvm-path /Library/Developer/CommandLineTools/usr
+cp flutter/macos/Runner/bridge_generated.h flutter/ios/Runner/bridge_generated.h
+```
+
+위 libclang 경로는 macOS Command Line Tools 설치 기준입니다. 다른 환경에서는 libclang이 설치된 접두 경로로 바꾸세요. 생성 중 오류가 나면 전체 앱 빌드로 넘어가지 말고 먼저 해결해야 합니다.
+
 기본 테스트는 실제 서버에 접속하지 않습니다.
 
 ```sh

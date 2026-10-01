@@ -62,6 +62,49 @@ Future<void> enterPairing(WidgetTester tester) async {
 }
 
 void main() {
+  testWidgets('host permission text remains readable on a narrow phone',
+      (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    String? resolved;
+    const details = DirectHostDetails(
+        certificate: 'synthetic-own-code',
+        endpoints: [],
+        password: '',
+        checks: [
+          DirectHostCheck('input', 'Keyboard and mouse control',
+              'Approve access in Android.', DirectCheckState.actionRequired,
+              action: 'Request access')
+        ]);
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: HdobbyDirectPairing(
+      canHost: true,
+      languageCode: 'en',
+      onPrepare: () async => details.certificate,
+      onPrepareHost: () async => details,
+      onInspect: (_) async => 'SYNTHETIC FINGERPRINT',
+      onReadPrevious: (_) async => '',
+      onSave: (_, __, ___) async => 'SYNTHETIC FINGERPRINT',
+      onResolveHost: (id) async {
+        resolved = id;
+      },
+      onCheckHost: (_) async => details,
+      onClose: () {},
+    ))));
+    await tapText(tester, 'Prepare this host');
+    final title = find.text('Keyboard and mouse control');
+    await tester.ensureVisible(title);
+    await tester.pumpAndSettle();
+    expect(tester.getSize(title).width, greaterThan(150));
+    expect(tester.takeException(), isNull);
+    await tapText(tester, 'Request access');
+    expect(resolved, 'input');
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets(
       'clipboard import is explicit and invalidates previously verified trust',
       (tester) async {

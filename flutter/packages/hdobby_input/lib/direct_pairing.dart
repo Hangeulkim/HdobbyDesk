@@ -324,14 +324,19 @@ class _HdobbyDirectPairingState extends State<HdobbyDirectPairing>
                               ? Icons.check_circle_outline
                               : Icons.info_outline),
                           title: Text(check.title),
-                          subtitle: Text(check.detail),
-                          trailing: check.action == null
-                              ? null
-                              : TextButton(
-                                  onPressed: _busy
-                                      ? null
-                                      : () => _checkHost(resolve: check.id),
-                                  child: Text(check.action!)),
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(check.detail),
+                              if (check.action != null)
+                                TextButton(
+                                    onPressed: _busy
+                                        ? null
+                                        : () => _checkHost(resolve: check.id),
+                                    child: Text(check.action!)),
+                            ],
+                          ),
                         ),
                       TextButton(
                           onPressed: () => setState(
