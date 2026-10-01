@@ -85,7 +85,15 @@ jobs:
                 $found = Get-Process hdobbydesk -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $expectedPath -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
                 if ($found) { break }
               }
-              if (!$found) { throw 'Distributed application did not create a window' }
+              if (!$found) {
+                $parent.Refresh()
+                Write-Output "Launcher exited: $($parent.HasExited)"
+                if ($parent.HasExited) { Write-Output "Launcher exit code: $($parent.ExitCode)" }
+                Write-Output "Expected executable exists: $(Test-Path $expectedPath)"
+                Get-Process hdobbydesk -ErrorAction SilentlyContinue | Select-Object Id,Path,MainWindowHandle | Format-Table -AutoSize
+                Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-3)} -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -in @('Application Error','Windows Error Reporting') } | Select-Object -First 3 -ExpandProperty Message
+                throw 'Distributed application did not create a window'
+              }
               Start-Sleep -Seconds 10
               $found.Refresh()
               if ($found.HasExited) { throw 'Distributed application exited after launch' }
