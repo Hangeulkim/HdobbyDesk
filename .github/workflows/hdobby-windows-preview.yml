@@ -2,6 +2,15 @@ name: HdobbyDesk Windows preview
 
 on:
   workflow_dispatch:
+    inputs:
+      candidate_patch:
+        description: Optional non-secret source patch (base64); test artifact only
+        required: false
+        type: string
+      candidate_sha256:
+        description: SHA-256 of the decoded optional patch
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -26,6 +35,25 @@ jobs:
           git -C libs/hbb_common -c core.autocrlf=false -c core.eol=lf checkout-index --force --all
           git show HEAD:patches/hbb-common-private-network.patch > patches/hbb-common-private-network.patch
           python scripts/apply_private_network.py --apply
+      - name: Apply optional source candidate for device verification
+        if: inputs.candidate_patch != ''
+        shell: bash
+        env:
+          CANDIDATE_PATCH: ${{ inputs.candidate_patch }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+        run: |
+          python - <<'PYCODE'
+          import base64, hashlib, os, pathlib, subprocess
+          patch = base64.b64decode(os.environ['CANDIDATE_PATCH'], validate=True)
+          if hashlib.sha256(patch).hexdigest() != os.environ['CANDIDATE_SHA256']:
+              raise SystemExit('Candidate patch checksum mismatch')
+          path = pathlib.Path('candidate.patch')
+          path.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', str(path)], check=True)
+          subprocess.run(['git', 'apply', str(path)], check=True)
+          path.unlink()
+          pathlib.Path('candidate-source-sha256.txt').write_text(hashlib.sha256(patch).hexdigest()+'\n')
+          PYCODE
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: '1.81.0'
@@ -80,7 +108,7 @@ jobs:
         run: python build.py --portable --flutter --hwcodec --skip-portable-pack
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: HdobbyDesk-windows-x64-built-bundle
+          name: ${{ inputs.candidate_patch != '' && 'HdobbyDesk-windows-x64-candidate-bundle' || 'HdobbyDesk-windows-x64-built-bundle' }}
           path: flutter/build/windows/x64/runner/Release/
           if-no-files-found: error
           retention-days: 14
@@ -111,7 +139,14 @@ jobs:
           $hashes | ForEach-Object { "$($_.Hash.ToLower())  $([System.IO.Path]::GetFileName($_.Path))" } | Set-Content dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: HdobbyDesk-windows-x64-preview
+          name: ${{ inputs.candidate_patch != '' && 'HdobbyDesk-windows-x64-candidate' || 'HdobbyDesk-windows-x64-preview' }}
           path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: inputs.candidate_patch != ''
+        with:
+          name: candidate-source-receipt
+          path: candidate-source-sha256.txt
           if-no-files-found: error
           retention-days: 14
