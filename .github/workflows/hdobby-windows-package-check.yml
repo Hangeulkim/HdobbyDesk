@@ -104,9 +104,12 @@ jobs:
               }
               Write-Output 'Distributed package window and startup stability check passed.'
             } finally {
-              Get-Process hdobbydesk -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $expectedPath } | Stop-Process
+              $ownedIds = @(Get-Process hdobbydesk -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $expectedPath } | Select-Object -ExpandProperty Id)
+              foreach ($ownedId in $ownedIds) {
+                Stop-Process -Id $ownedId -Force -ErrorAction SilentlyContinue
+              }
               $parent.Refresh()
-              if (!$parent.HasExited) { Stop-Process -Id $parent.Id }
+              if (!$parent.HasExited) { Stop-Process -Id $parent.Id -Force -ErrorAction SilentlyContinue }
             }
           }
           $zipExe = (Resolve-Path unpacked/hdobbydesk.exe).Path
