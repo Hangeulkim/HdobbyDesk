@@ -9,6 +9,6 @@ class NativeUiHandler extends NativeHandler {
 
   @override
   bool onEvent(Map<String, dynamic> evt) {
-      throw UnimplementedError();
+    throw UnimplementedError();
   }
 }

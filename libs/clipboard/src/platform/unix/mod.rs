@@ -36,7 +36,7 @@ pub(crate) const BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 
 // begin of epoch used by microsoft
 // 1601-01-01 00:00:00 + LDAP_EPOCH_DELTA*(100 ns) = 1970-01-01 00:00:00
-const LDAP_EPOCH_DELTA: u64 = 116444772610000000;
+const LDAP_EPOCH_DELTA: u64 = 116444736000000000;
 
 lazy_static! {
     static ref REMOTE_FORMAT_MAP: DashMap<i32, String> = DashMap::from_iter(

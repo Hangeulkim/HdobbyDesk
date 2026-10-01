@@ -16,8 +16,10 @@ mod es;
 mod et;
 mod eu;
 mod fa;
-mod gu;
+mod fi;
 mod fr;
+mod ge;
+mod gu;
 mod he;
 mod hi;
 mod hr;
@@ -29,6 +31,7 @@ mod ko;
 mod kz;
 mod lt;
 mod lv;
+mod ml;
 mod nb;
 mod nl;
 mod pl;
@@ -41,15 +44,12 @@ mod sl;
 mod sq;
 mod sr;
 mod sv;
+mod ta;
 mod th;
 mod tr;
 mod tw;
 mod uk;
 mod vi;
-mod ta;
-mod ge;
-mod fi;
-mod ml;
 
 pub const LANGS: &[(&str, &str)] = &[
     ("en", "English"),
@@ -158,6 +158,30 @@ pub fn translate(name: String) -> String {
     translate_locale(name, &locale)
 }
 
+fn replace_product_name_for_app(source: &str, app_name: &str) -> String {
+    if !source.contains("RustDesk") && !source.contains("rustdesk") {
+        return source.to_owned();
+    }
+
+    if !app_name.contains("RustDesk") && !app_name.contains("rustdesk") {
+        return source
+            .replace("RustDesk", app_name)
+            .replace("rustdesk", &app_name.to_lowercase());
+    }
+
+    // Preserve a custom app name that itself contains the legacy token while
+    // replacing any other occurrence exactly once.
+    const PLACEHOLDER: &str = "#A-P-P-N-A-M-E#";
+    if source.contains(PLACEHOLDER) {
+        return source.to_owned();
+    }
+    source
+        .replace(app_name, PLACEHOLDER)
+        .replace("RustDesk", app_name)
+        .replace("rustdesk", &app_name.to_lowercase())
+        .replace(PLACEHOLDER, app_name)
+}
+
 pub fn translate_locale(name: String, locale: &str) -> String {
     let lang = resolve_lang(
         &hbb_common::config::LocalConfig::get_option("lang"),
@@ -222,34 +246,7 @@ pub fn translate_locale(name: String, locale: &str) -> String {
         if let Some(value) = placeholder_value.as_ref() {
             s = s.replace("{}", &value);
         }
-        if !crate::is_rustdesk() {
-            if s.contains("RustDesk")
-                && !name.starts_with("upgrade_rustdesk_server_pro")
-                && name != "powered_by_me"
-            {
-                let app_name = crate::get_app_name();
-                if !app_name.contains("RustDesk") {
-                    s = s.replace("RustDesk", &app_name);
-                } else {
-                    // https://github.com/rustdesk/rustdesk-server-pro/issues/845
-                    // If app_name contains "RustDesk" (e.g., "RustDesk-Admin"), we need to avoid
-                    // replacing "RustDesk" within the already-substituted app_name, which would
-                    // cause duplication like "RustDesk-Admin" -> "RustDesk-Admin-Admin".
-                    //
-                    // app_name only contains alphanumeric and hyphen.
-                    const PLACEHOLDER: &str = "#A-P-P-N-A-M-E#";
-                    if !s.contains(PLACEHOLDER) {
-                        s = s.replace(&app_name, PLACEHOLDER);
-                        s = s.replace("RustDesk", &app_name);
-                        s = s.replace(PLACEHOLDER, &app_name);
-                    } else {
-                        // It's very unlikely to reach here.
-                        // Skip replacement to avoid incorrect result.
-                    }
-                }
-            }
-        }
-        s
+        replace_product_name_for_app(&s, &crate::get_app_name())
     };
     if let Some(v) = m.get(&name as &str) {
         if !v.is_empty() {
@@ -306,6 +303,35 @@ mod test {
             f("{2} times {4} makes {8}"),
             ("{} times {4} makes {8}".to_string(), Some("2".to_string()))
         );
+    }
+
+    #[test]
+    fn test_private_brand_replaces_all_legacy_product_labels() {
+        use super::replace_product_name_for_app as f;
+
+        assert_eq!(f("About RustDesk", "HdobbyDesk"), "About HdobbyDesk");
+        assert_eq!(
+            f("Powered by RustDesk", "HdobbyDesk"),
+            "Powered by HdobbyDesk"
+        );
+        assert_eq!(
+            f("rustdesk information", "HdobbyDesk"),
+            "hdobbydesk information"
+        );
+        assert_eq!(
+            f("About RustDesk", "HdobbyDesk-Admin"),
+            "About HdobbyDesk-Admin"
+        );
+    }
+
+    #[test]
+    fn test_mac_permission_help_uses_official_os_documentation() {
+        let link = super::en::T
+            .get("doc_mac_permission")
+            .copied()
+            .unwrap_or_default();
+        assert!(link.starts_with("https://support.apple.com/guide/mac-help/"));
+        assert!(!link.to_ascii_lowercase().contains("hdobbydesk"));
     }
 
     #[test]

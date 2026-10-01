@@ -331,6 +331,9 @@ class ToReleaseKeys {
 }
 
 class InputModel {
+  // Called after a completed left click so mobile UI can inspect the remote
+  // cursor and offer its keyboard when a text field was selected.
+  void Function()? onLeftClick;
   // Side mouse button support for Linux.
   // Flutter's Linux embedder drops X11 button 8/9 events, so we capture them
   // natively via GDK and forward through the platform channel.
@@ -350,7 +353,7 @@ class InputModel {
     if (_sideButtonChannelInitialized) return;
     _sideButtonChannelInitialized = true;
 
-    const channel = MethodChannel('org.rustdesk.rustdesk/side_buttons');
+    const channel = MethodChannel('org.hdobby.hdobbydesk/side_buttons');
     channel.setMethodCallHandler((call) async {
       if (call.method == 'onSideMouseButton') {
         final args = call.arguments as Map<dynamic, dynamic>;
@@ -366,8 +369,10 @@ class InputModel {
               !model.isViewCamera) {
             _sideButtonDownModels[mb] = model;
             // Fire-and-forget to avoid blocking the platform channel handler.
-            unawaited(model._sendMouseUnchecked(type, mb).catchError((Object e) {
-              debugPrint('[InputModel] failed to send side button $type for $mb: $e');
+            unawaited(
+                model._sendMouseUnchecked(type, mb).catchError((Object e) {
+              debugPrint(
+                  '[InputModel] failed to send side button $type for $mb: $e');
             }));
           }
         } else {
@@ -377,8 +382,10 @@ class InputModel {
           // release always goes through even if permissions changed.
           final model = _sideButtonDownModels.remove(mb);
           if (model != null) {
-            unawaited(model._sendMouseUnchecked(type, mb).catchError((Object e) {
-              debugPrint('[InputModel] failed to send side button $type for $mb: $e');
+            unawaited(
+                model._sendMouseUnchecked(type, mb).catchError((Object e) {
+              debugPrint(
+                  '[InputModel] failed to send side button $type for $mb: $e');
             }));
           }
         }
@@ -1086,6 +1093,7 @@ class InputModel {
   Future<void> tap(MouseButtons button) async {
     await sendMouse('down', button);
     await sendMouse('up', button);
+    if (button == MouseButtons.left) onLeftClick?.call();
   }
 
   Future<void> tapDown(MouseButtons button) async {
@@ -1094,6 +1102,7 @@ class InputModel {
 
   Future<void> tapUp(MouseButtons button) async {
     await sendMouse('up', button);
+    if (button == MouseButtons.left) onLeftClick?.call();
   }
 
   /// Send scroll event with scroll distance [y].
@@ -1511,7 +1520,6 @@ class InputModel {
   }
 
   void onPointDownImage(PointerDownEvent e) {
-    debugPrint("onPointDownImage ${e.kind}");
     _stopFling = true;
     if (isDesktop) _queryOtherWindowCoords = true;
     _remoteWindowCoords = [];
@@ -1550,6 +1558,12 @@ class InputModel {
             .sendRelativeMouseButton(_getMouseEvent(e, _kMouseEventDown));
       } else {
         final canvasPosition = _pointerPositionForRemoteCanvas(e);
+        if (parent.target!.ffiModel.collaborativeCursor) {
+          // A collaborative hover is presence-only on the host. Send the
+          // current point immediately before button-down as well so a click
+          // remains correct even when the platform omitted prior hover events.
+          handleMouse(getMouseEventMove(), canvasPosition);
+        }
         handleMouse(_getMouseEvent(e, _kMouseEventDown), canvasPosition);
       }
     }
@@ -1632,7 +1646,7 @@ class InputModel {
   static Future<Rect?> fillRemoteCoordsAndGetCurFrame(
       List<RemoteWindowCoords> remoteWindowCoords) async {
     final coords =
-        await rustDeskWinManager.getOtherRemoteWindowCoordsFromMain();
+        await hdobbyDeskWinManager.getOtherRemoteWindowCoordsFromMain();
     final wc = WindowController.fromWindowId(kWindowId!);
     try {
       final frame = await wc.getFrame();
@@ -1660,7 +1674,8 @@ class InputModel {
     if (e is PointerScrollEvent) {
       final rawDx = e.scrollDelta.dx;
       final rawDy = e.scrollDelta.dy;
-      final dominantDelta = rawDx.abs() > rawDy.abs() ? rawDx.abs() : rawDy.abs();
+      final dominantDelta =
+          rawDx.abs() > rawDy.abs() ? rawDx.abs() : rawDy.abs();
       final isSmooth = dominantDelta < 1;
       final nowUs = DateTime.now().microsecondsSinceEpoch;
       final dtUs = _lastWheelTsUs == 0 ? 0 : nowUs - _lastWheelTsUs;

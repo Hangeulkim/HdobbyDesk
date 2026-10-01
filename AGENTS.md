@@ -1,4 +1,13 @@
-# RustDesk Guide
+# HdobbyDesk Guide
+
+## hdobby Private Configuration and Testing
+
+* Do not commit until actual Windows, Android, and MacBook testing is complete. Compilation and local unit tests alone do not satisfy this gate. iPhone hardware is unavailable; keep iPhone explicitly unverified and exclude it from the pre-commit device gate.
+* Default tests must run locally without connecting to an actual remote server.
+* Keep live device/server tests opt-in. The person running them must provide the endpoint and authentication values explicitly at runtime. Never default to a public server or a previously used device.
+* Never commit actual server addresses, private network IPs, device IDs, passwords, keys, certificates, operational configuration, logs, captures, or backups. Keep those outside Git; commit only empty configuration examples when needed.
+* Run `python3 scripts/check_private_config.py` and review the staged diff before any commit or publication. Do not print suspected secret values in reports.
+* Preserve the user's direct-first requirement: no public ID/relay fallback; only a separately supplied internal relay may be considered. Do not claim the current upstream native binaries already enforce that policy.
 
 ## Project Layout
 

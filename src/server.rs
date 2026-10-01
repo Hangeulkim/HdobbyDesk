@@ -66,14 +66,20 @@ pub mod input_service {
     pub const NAME_WINDOW_FOCUS: &'static str = "";
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod collaborative_input;
 mod connection;
-mod login_failure_check;
 pub mod display_service;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod keyboard_gamepad;
+mod login_failure_check;
 #[cfg(windows)]
 pub mod portable_service;
 mod service;
 mod video_qos;
 pub mod video_service;
+#[cfg(target_os = "windows")]
+mod virtual_gamepad;
 
 #[cfg(all(target_os = "windows", feature = "flutter"))]
 pub mod printer_service;
@@ -193,6 +199,64 @@ async fn accept_connection_(
     Ok(())
 }
 
+// Kept separate from capture/input startup so the transport can be tested on loopback.
+pub(crate) async fn secure_stream(
+    stream: &mut Stream,
+    local_id: &str,
+    sk: &[u8],
+    pk: &[u8],
+) -> ResultType<()> {
+    if pk.len() != sign::PUBLICKEYBYTES || sk.len() != sign::SECRETKEYBYTES {
+        bail!("Handshake failed: host identity key is unavailable");
+    }
+    let mut sk_ = [0u8; sign::SECRETKEYBYTES];
+    sk_[..].copy_from_slice(&sk);
+    let sk = sign::SecretKey(sk_);
+    let mut msg_out = Message::new();
+    let (our_pk_b, our_sk_b) = box_::gen_keypair();
+    msg_out.set_signed_id(SignedId {
+        id: sign::sign(
+            &IdPk {
+                id: local_id.to_owned(),
+                pk: Bytes::from(our_pk_b.0.to_vec()),
+                ..Default::default()
+            }
+            .write_to_bytes()
+            .unwrap_or_default(),
+            &sk,
+        )
+        .into(),
+        ..Default::default()
+    });
+    timeout(CONNECT_TIMEOUT, stream.send(&msg_out)).await??;
+    match timeout(CONNECT_TIMEOUT, stream.next()).await? {
+        Some(res) => {
+            let bytes = res?;
+            if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
+                if let Some(message::Union::PublicKey(pk)) = msg_in.union {
+                    if pk.asymmetric_value.len() == box_::PUBLICKEYBYTES {
+                        stream.set_key(tcp::Encrypt::decode(
+                            &pk.symmetric_value,
+                            &pk.asymmetric_value,
+                            &our_sk_b,
+                        )?);
+                    } else {
+                        bail!("Handshake failed: invalid public sign key length from peer");
+                    }
+                } else {
+                    bail!("Handshake failed: invalid message type");
+                }
+            } else {
+                bail!("Handshake failed: invalid message format");
+            }
+        }
+        None => {
+            bail!("Failed to receive public key");
+        }
+    }
+    Ok(())
+}
+
 pub async fn create_tcp_connection(
     server: ServerPtr,
     stream: Stream,
@@ -202,56 +266,9 @@ pub async fn create_tcp_connection(
 ) -> ResultType<()> {
     let mut stream = stream;
     let id = server.write().unwrap().get_new_id();
-    let (sk, pk) = Config::get_key_pair();
-    if secure && pk.len() == sign::PUBLICKEYBYTES && sk.len() == sign::SECRETKEYBYTES {
-        let mut sk_ = [0u8; sign::SECRETKEYBYTES];
-        sk_[..].copy_from_slice(&sk);
-        let sk = sign::SecretKey(sk_);
-        let mut msg_out = Message::new();
-        let (our_pk_b, our_sk_b) = box_::gen_keypair();
-        msg_out.set_signed_id(SignedId {
-            id: sign::sign(
-                &IdPk {
-                    id: Config::get_id(),
-                    pk: Bytes::from(our_pk_b.0.to_vec()),
-                    ..Default::default()
-                }
-                .write_to_bytes()
-                .unwrap_or_default(),
-                &sk,
-            )
-            .into(),
-            ..Default::default()
-        });
-        timeout(CONNECT_TIMEOUT, stream.send(&msg_out)).await??;
-        match timeout(CONNECT_TIMEOUT, stream.next()).await? {
-            Some(res) => {
-                let bytes = res?;
-                if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
-                    if let Some(message::Union::PublicKey(pk)) = msg_in.union {
-                        if pk.asymmetric_value.len() == box_::PUBLICKEYBYTES {
-                            stream.set_key(tcp::Encrypt::decode(
-                                &pk.symmetric_value,
-                                &pk.asymmetric_value,
-                                &our_sk_b,
-                            )?);
-                        } else if pk.asymmetric_value.is_empty() {
-                            Config::set_key_confirmed(false);
-                            log::info!("Force to update pk");
-                        } else {
-                            bail!("Handshake failed: invalid public sign key length from peer");
-                        }
-                    } else {
-                        log::error!("Handshake failed: invalid message type");
-                    }
-                } else {
-                    bail!("Handshake failed: invalid message format");
-                }
-            }
-            None => {
-                bail!("Failed to receive public key");
-            }
-        }
+    if secure {
+        let (sk, pk) = Config::get_key_pair();
+        secure_stream(&mut stream, &Config::get_id(), &sk, &pk).await?;
     }
 
     #[cfg(target_os = "macos")]
@@ -273,12 +290,15 @@ pub async fn create_tcp_connection(
 pub async fn accept_connection(
     server: ServerPtr,
     socket: Stream,
-    peer_addr: SocketAddr,
+    _peer_addr: SocketAddr,
     secure: bool,
     meta: ConnectionMeta,
 ) {
-    if let Err(err) = accept_connection_(server, socket, secure, meta).await {
-        log::warn!("Failed to accept connection from {}: {}", peer_addr, err);
+    if accept_connection_(server, socket, secure, meta)
+        .await
+        .is_err()
+    {
+        log::warn!("Failed to accept a connection");
     }
 }
 
@@ -291,7 +311,7 @@ pub async fn create_relay_connection(
     ipv4: bool,
     meta: ConnectionMeta,
 ) {
-    if let Err(err) = create_relay_connection_(
+    if create_relay_connection_(
         server,
         relay_server,
         uuid.clone(),
@@ -301,13 +321,9 @@ pub async fn create_relay_connection(
         meta,
     )
     .await
+    .is_err()
     {
-        log::error!(
-            "Failed to create relay connection for {} with uuid {}: {}",
-            peer_addr,
-            uuid,
-            err
-        );
+        log::error!("Failed to create a relay connection");
     }
 }
 
@@ -320,6 +336,9 @@ async fn create_relay_connection_(
     ipv4: bool,
     meta: ConnectionMeta,
 ) -> ResultType<()> {
+    if !crate::configured_relay_allowed(&relay_server) {
+        bail!("Relay is disabled or does not match your configured relay server");
+    }
     let mut stream = socket_client::connect_tcp(
         socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
         CONNECT_TIMEOUT,
@@ -783,8 +802,7 @@ async fn sync_and_watch_config_dir(sync_done_tx: Option<tokio::sync::oneshot::Se
                 loop {
                     sleep(CONFIG_SYNC_INTERVAL_SECS).await;
                     let cfg = (Config::get(), Config2::get());
-                    let should_sync =
-                        cfg != cfg0 || (is_root_config_empty && !cfg.0.is_empty());
+                    let should_sync = cfg != cfg0 || (is_root_config_empty && !cfg.0.is_empty());
                     if should_sync {
                         if is_root_config_empty {
                             log::info!("root config is empty, sync our config to root");
@@ -833,7 +851,7 @@ pub async fn stop_main_window_process() {
     #[cfg(windows)]
     {
         // in case above failure, e.g. zombie process
-        if let Err(e) = crate::platform::try_kill_rustdesk_main_window_process() {
+        if let Err(e) = crate::platform::try_kill_hdobbydesk_main_window_process() {
             log::error!("kill failed: {}", e);
         }
     }

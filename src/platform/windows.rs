@@ -100,7 +100,8 @@ use winreg::{enums::*, RegKey};
 mod acl;
 pub(crate) use acl::current_process_user_sid_string;
 pub use acl::{
-    set_path_permission, set_path_permission_for_portable_service_shmem_dir,
+    set_path_permission, set_path_permission_for_machine_identity,
+    set_path_permission_for_portable_service_shmem_dir,
     set_path_permission_for_portable_service_shmem_file,
     validate_path_for_portable_service_shmem_dir,
 };
@@ -108,6 +109,145 @@ pub use acl::{
 pub const FLUTTER_RUNNER_WIN32_WINDOW_CLASS: &'static str = "FLUTTER_RUNNER_WIN32_WINDOW"; // main window, install window
 pub const EXPLORER_EXE: &'static str = "explorer.exe";
 pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
+
+const WDA_EXCLUDEFROMCAPTURE_HDOBBY: DWORD = 0x0000_0011;
+const MANAGEMENT_WINDOW_PROTECTION_ATTEMPTS: usize = 100;
+const MANAGEMENT_WINDOW_PROTECTION_INTERVAL: Duration = Duration::from_millis(50);
+
+struct ManagementWindowCaptureSearch {
+    process_id: DWORD,
+    app_name: String,
+    protected: usize,
+    failed: usize,
+    last_error: DWORD,
+}
+
+fn is_management_window_title(title: &str, app_name: &str) -> bool {
+    title == app_name
+        || title == format!("{app_name} - Connection Manager")
+        || title == format!("{app_name} - Install")
+}
+
+fn is_management_window(hwnd: HWND) -> bool {
+    if hwnd.is_null() {
+        return false;
+    }
+    unsafe {
+        let root = GetAncestor(hwnd, GA_ROOTOWNER);
+        if root.is_null() {
+            return false;
+        }
+        let mut class_name = [0_u16; 64];
+        let class_len = GetClassNameW(root, class_name.as_mut_ptr(), class_name.len() as i32);
+        if class_len <= 0
+            || OsString::from_wide(&class_name[..class_len as usize]).to_string_lossy()
+                != FLUTTER_RUNNER_WIN32_WINDOW_CLASS
+        {
+            return false;
+        }
+        let title_len = GetWindowTextLengthW(root);
+        if title_len <= 0 {
+            return false;
+        }
+        let mut title = vec![0_u16; title_len as usize + 1];
+        let copied = GetWindowTextW(root, title.as_mut_ptr(), title.len() as i32);
+        copied > 0
+            && is_management_window_title(
+                &OsString::from_wide(&title[..copied as usize]).to_string_lossy(),
+                &crate::get_app_name(),
+            )
+    }
+}
+
+/// Capture exclusion changes pixels, not hit testing. Never inject remote
+/// input into a management window whose contents are invisible to the viewer.
+pub fn is_management_window_at(x: i32, y: i32) -> bool {
+    unsafe { is_management_window(WindowFromPoint(POINT { x, y })) }
+}
+
+pub fn is_management_window_foreground() -> bool {
+    unsafe { is_management_window(GetForegroundWindow()) }
+}
+
+unsafe extern "system" fn protect_management_window(hwnd: HWND, state: LPARAM) -> BOOL {
+    let state = &mut *(state as *mut ManagementWindowCaptureSearch);
+    let mut process_id = 0;
+    GetWindowThreadProcessId(hwnd, &mut process_id);
+    if process_id != state.process_id {
+        return TRUE;
+    }
+
+    let title_length = GetWindowTextLengthW(hwnd);
+    if title_length <= 0 {
+        return TRUE;
+    }
+    let mut title = vec![0_u16; title_length as usize + 1];
+    let copied = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+    if copied <= 0 {
+        return TRUE;
+    }
+    let title = OsString::from_wide(&title[..copied as usize])
+        .to_string_lossy()
+        .into_owned();
+    if !is_management_window_title(&title, &state.app_name) {
+        return TRUE;
+    }
+
+    if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE_HDOBBY) == FALSE {
+        state.failed += 1;
+        state.last_error = GetLastError();
+    } else {
+        state.protected += 1;
+    }
+    TRUE
+}
+
+/// Protect the local host-management window when an older compatible Flutter
+/// runner loads a newer HdobbyDesk core. The runner creates its HWND only after
+/// `hdobbydesk_core_main_args` returns, so this bounded worker waits for that
+/// specific top-level title. Remote desktop child windows never match.
+pub fn schedule_management_window_capture_protection() {
+    let app_name = crate::get_app_name();
+    let result = std::thread::Builder::new()
+        .name("management-capture-protection".to_owned())
+        .spawn(move || {
+            for _ in 0..MANAGEMENT_WINDOW_PROTECTION_ATTEMPTS {
+                let mut state = ManagementWindowCaptureSearch {
+                    process_id: unsafe { GetCurrentProcessId() },
+                    app_name: app_name.clone(),
+                    protected: 0,
+                    failed: 0,
+                    last_error: 0,
+                };
+                unsafe {
+                    EnumWindows(
+                        Some(protect_management_window),
+                        &mut state as *mut ManagementWindowCaptureSearch as LPARAM,
+                    );
+                }
+                if state.protected > 0 {
+                    log::info!(
+                        "Excluded {} HdobbyDesk management window(s) from capture",
+                        state.protected
+                    );
+                    return;
+                }
+                if state.failed > 0 {
+                    log::warn!(
+                        "Windows rejected capture exclusion for {} HdobbyDesk management window(s): {}",
+                        state.failed,
+                        state.last_error
+                    );
+                    return;
+                }
+                std::thread::sleep(MANAGEMENT_WINDOW_PROTECTION_INTERVAL);
+            }
+            log::debug!("No HdobbyDesk management window appeared during capture-protection startup");
+        });
+    if let Err(error) = result {
+        log::warn!("Could not start management-window capture protection: {error}");
+    }
+}
 
 const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
@@ -139,6 +279,20 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
         }
         let out = out.assume_init();
         Some((out.x, out.y))
+    }
+}
+
+/// A click can focus an edit control without changing the cursor handle. Read
+/// the foreground caret in the same desktop session used for cursor capture.
+pub fn is_text_input_focused() -> bool {
+    crate::portable_service::client::is_text_input_focused()
+}
+
+pub(crate) fn is_text_input_focused_local() -> bool {
+    unsafe {
+        let mut info: GUITHREADINFO = mem::zeroed();
+        info.cbSize = mem::size_of::<GUITHREADINFO>() as DWORD;
+        GetGUIThreadInfo(0, &mut info) != FALSE && !info.hwndCaret.is_null()
     }
 }
 
@@ -307,6 +461,7 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
             hoty: ii.0.yHotspot as _,
             width: width as _,
             height: height as _,
+            text_input_cursor: hcursor == LoadCursorW(null_mut(), IDC_IBEAM) as u64,
             ..Default::default()
         })
     }
@@ -674,7 +829,13 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
 
     let mut session_id = unsafe { get_current_session(share_rdp()) };
     log::info!("session id {}", session_id);
-    let mut h_process = launch_server(session_id, true).await.unwrap_or(NULL);
+    // Windows reports MAX while the physical console is being attached or
+    // detached. Do not close a live host or launch one into that sentinel ID.
+    let mut h_process = if session_id == u32::MAX {
+        NULL
+    } else {
+        launch_server(session_id, true).await.unwrap_or(NULL)
+    };
     let mut incoming = ipc::new_listener(crate::POSTFIX_SERVICE).await?;
     let mut stored_usid = None;
     loop {
@@ -684,7 +845,7 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
             .collect();
         if !sids.contains(&session_id) || !is_share_rdp() {
             let current_active_session = unsafe { get_current_session(share_rdp()) };
-            if session_id != current_active_session {
+            if current_active_session != u32::MAX && session_id != current_active_session {
                 session_id = current_active_session;
                 // https://github.com/rustdesk/rustdesk/discussions/10039
                 let count = ipc::get_port_forward_session_count(1000).await.unwrap_or(0);
@@ -718,7 +879,7 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                             }
                             ipc::Data::UserSid(usid) => {
                                 if let Some(usid) = usid {
-                                    if session_id != usid {
+                                    if usid != u32::MAX && session_id != usid {
                                         log::info!(
                                             "session changed from {} to {}",
                                             session_id,
@@ -741,11 +902,15 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                 // timeout
                 unsafe {
                     let tmp = get_current_session(share_rdp());
-                    if tmp == 0xFFFFFFFF {
-                        continue;
-                    }
                     let mut close_sent = false;
-                    if tmp != session_id && stored_usid != Some(session_id) {
+                    // A temporarily unavailable active session must not stop
+                    // supervision of the server in the last valid session.
+                    // Otherwise a server that exits while Windows is locked
+                    // stays down until session enumeration recovers.
+                    if tmp != u32::MAX
+                        && tmp != session_id
+                        && stored_usid != Some(session_id)
+                    {
                         log::info!("session changed from {} to {}", session_id, tmp);
                         session_id = tmp;
                         let count = ipc::get_port_forward_session_count(1000).await.unwrap_or(0);
@@ -753,6 +918,9 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                             send_close_async("").await.ok();
                             close_sent = true;
                         }
+                    }
+                    if session_id == u32::MAX {
+                        continue;
                     }
                     let mut exit_code: DWORD = 0;
                     if h_process.is_null()
@@ -1032,7 +1200,10 @@ pub fn try_change_desktop() -> bool {
 }
 
 fn share_rdp() -> BOOL {
-    if get_reg("share_rdp") != "false" {
+    // Default to the physical console. Sharing an active RDP session is useful for
+    // administrators, but it surprises users who expect the controlled machine's
+    // monitor to mirror the remote view. Require an explicit opt-in instead.
+    if get_reg("share_rdp") == "true" {
         TRUE
     } else {
         FALSE
@@ -1228,8 +1399,8 @@ pub fn portable_service_logon_helper_paths() -> Option<(PathBuf, PathBuf)> {
         .home_dir()
         .join("AppData")
         .join("Local")
-        .join("rustdesk-sciter");
-    let dst = dir.join("rustdesk.exe");
+        .join("hdobbydesk-sciter");
+    let dst = dir.join("hdobbydesk.exe");
     Some((dir, dst))
 }
 
@@ -1986,11 +2157,182 @@ fn get_public_base_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
+const DIRECT_TLS_IDENTITY_FILE: &str = "hdobby-direct-tls-identity.json";
+const DIRECT_HOST_STATUS_FILE: &str = "direct-host.status";
+
+fn program_data_dir() -> ResultType<PathBuf> {
+    let path = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| {
+            let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
+            PathBuf::from(format!("{drive}\\ProgramData"))
+        });
+    if !path.is_absolute() {
+        bail!("Windows machine storage is unavailable");
+    }
+    Ok(path)
+}
+
+fn create_and_protect_identity_dir(path: &Path) -> ResultType<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err.into()),
+    }
+    set_path_permission_for_machine_identity(path, true)
+}
+
+/// Stable, update-independent host identity. This directory is outside the
+/// executable tree and normal app-update cleanup.
+pub fn direct_tls_identity_path() -> ResultType<PathBuf> {
+    Ok(program_data_dir()?
+        .join(crate::get_app_name())
+        .join("identity")
+        .join(DIRECT_TLS_IDENTITY_FILE))
+}
+
+/// The protected machine identity doubles as the installed host's durable
+/// enable marker. Windows services run under a different profile from the UI,
+/// so a per-user `direct-server` option cannot be the sole source of truth
+/// after a service restart or boot.
+pub fn direct_tls_machine_enabled() -> bool {
+    if !is_installed() {
+        return false;
+    }
+    direct_tls_identity_path()
+        .ok()
+        .and_then(|path| std::fs::symlink_metadata(path).ok())
+        .is_some_and(|metadata| metadata.file_type().is_file())
+}
+
+/// Record a fixed, non-sensitive startup stage beside the protected machine identity.
+/// This gives administrators enough information to diagnose an unavailable direct host
+/// without writing endpoints, credentials, certificate material, or error text to disk.
+pub fn write_direct_host_status(stage: &'static str) {
+    if !matches!(
+        stage,
+        "start_all"
+            | "server_initializing"
+            | "server_ready"
+            | "listener_task_spawned"
+            | "evaluating"
+            | "disabled"
+            | "identity_preparing"
+            | "identity_prepare_failed"
+            | "identity_system_rejected"
+            | "identity_path_resolution_failed"
+            | "identity_app_acl_failed"
+            | "identity_dir_acl_failed"
+            | "identity_storage_failed"
+            | "identity_file_acl_failed"
+            | "identity_config_saved"
+            | "identity_path_empty"
+            | "identity_loading"
+            | "identity_load_failed"
+            | "binding"
+            | "bind_failed"
+            | "listening"
+            | "accept_failed"
+    ) {
+        return;
+    }
+    let Some(identity_dir) = direct_tls_identity_path()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    if identity_dir.is_dir() {
+        let _ = std::fs::write(identity_dir.join(DIRECT_HOST_STATUS_FILE), stage.as_bytes());
+    }
+}
+
+/// Called only by the privileged Windows host process. Existing per-service
+/// identity is migrated once; a valid destination is never overwritten.
+pub fn prepare_direct_tls_identity() -> ResultType<hbb_common::direct_tls::Identity> {
+    use hbb_common::direct_tls::{Identity, IDENTITY_FILE_OPTION};
+
+    if !is_installed() {
+        let path = Config::path(DIRECT_TLS_IDENTITY_FILE);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let identity = Identity::load_or_create(&path)?;
+        Config::set_option(
+            IDENTITY_FILE_OPTION.to_owned(),
+            path.to_string_lossy().into_owned(),
+        );
+        return Ok(identity);
+    }
+    if !is_root() {
+        write_direct_host_status("identity_system_rejected");
+        bail!("The installed host service must prepare its machine identity");
+    }
+
+    let target = direct_tls_identity_path().map_err(|err| {
+        write_direct_host_status("identity_path_resolution_failed");
+        err
+    })?;
+    let identity_dir = target
+        .parent()
+        .ok_or_else(|| anyhow!("Windows machine identity directory is unavailable"))?;
+    let app_dir = identity_dir
+        .parent()
+        .ok_or_else(|| anyhow!("Windows application storage is unavailable"))?;
+    create_and_protect_identity_dir(app_dir).map_err(|err| {
+        write_direct_host_status("identity_app_acl_failed");
+        err
+    })?;
+    create_and_protect_identity_dir(identity_dir).map_err(|err| {
+        write_direct_host_status("identity_dir_acl_failed");
+        err
+    })?;
+
+    // This is the historical service-account location used by earlier builds.
+    // It is trusted only because Config::path is resolved inside this privileged
+    // service process, never from a user-supplied option.
+    let legacy = Config::path(DIRECT_TLS_IDENTITY_FILE);
+    // Repair a present identity's private ACL before opening it. An interrupted
+    // installer or an older build can leave a valid identity with an empty or
+    // incomplete DACL; waiting until after `load` would permanently wedge the
+    // direct host even though LocalSystem can safely restore the fixed policy.
+    let target_exists = match std::fs::symlink_metadata(&target) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            write_direct_host_status("identity_storage_failed");
+            return Err(err.into());
+        }
+    };
+    if target_exists {
+        set_path_permission_for_machine_identity(&target, false).map_err(|err| {
+            write_direct_host_status("identity_file_acl_failed");
+            err
+        })?;
+    }
+    let identity =
+        Identity::load_or_create_migrating(&target, &[legacy.as_path()]).map_err(|err| {
+            write_direct_host_status("identity_storage_failed");
+            err
+        })?;
+    set_path_permission_for_machine_identity(&target, false).map_err(|err| {
+        write_direct_host_status("identity_file_acl_failed");
+        err
+    })?;
+    Config::set_option(
+        IDENTITY_FILE_OPTION.to_owned(),
+        target.to_string_lossy().into_owned(),
+    );
+    write_direct_host_status("identity_config_saved");
+    Ok(identity)
+}
+
 #[inline]
 pub fn get_custom_client_staging_dir() -> PathBuf {
     get_public_base_dir()
-        .join("RustDesk")
-        .join("RustDeskCustomClientStaging")
+        .join("HdobbyDesk")
+        .join("HdobbyDeskCustomClientStaging")
 }
 
 /// Removes the custom client staging directory.
@@ -1999,7 +2341,7 @@ pub fn get_custom_client_staging_dir() -> PathBuf {
 ///
 /// Rationale
 /// - The staging directory only contains a small `custom.txt`, leaving it is harmless.
-/// - Deleting directories under a public location (e.g., C:\\ProgramData\\RustDesk) is
+/// - Deleting directories under a public location (e.g., C:\\ProgramData\\HdobbyDesk) is
 ///   susceptible to TOCTOU attacks if an unprivileged user can replace the path with a
 ///   symlink/junction between checks and deletion.
 ///
@@ -2171,7 +2513,7 @@ pub fn bootstrap() -> bool {
     }
     #[cfg(not(debug_assertions))]
     {
-        // This function will cause `'sciter.dll' was not found neither in PATH nor near the current executable.` when debugging RustDesk.
+        // This function will cause `'sciter.dll' was not found neither in PATH nor near the current executable.` when debugging HdobbyDesk.
         // Only call set_safe_load_dll() on Windows 10 or greater
         if is_win_10_or_greater() {
             set_safe_load_dll()
@@ -3053,11 +3395,11 @@ mod cert {
     use hbb_common::ResultType;
 
     extern "C" {
-        fn DeleteRustDeskTestCertsW();
+        fn DeleteHdobbyDeskTestCertsW();
     }
     pub fn uninstall_cert() -> ResultType<()> {
         unsafe {
-            DeleteRustDeskTestCertsW();
+            DeleteHdobbyDeskTestCertsW();
         }
         Ok(())
     }
@@ -3391,7 +3733,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     // md \"{path}\"
     //
     // We need `taskkill` because:
-    // 1. There may be some other processes like `rustdesk --connect` are running.
+    // 1. There may be some other processes like `hdobbydesk --connect` are running.
     // 2. Sometimes, the main window and the tray icon are showing
     // while I cannot find them by `tasklist` or the methods above.
     // There's should be 4 processes running: service, server, tray and main window.
@@ -3746,8 +4088,8 @@ pub fn try_remove_temp_update_files() {
         if let Ok(entry) = entry {
             let path = entry.path();
             if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                // Match files like rustdesk-*.msi or rustdesk-*.exe
-                if file_name.starts_with("rustdesk-")
+                // Match files like hdobbydesk-*.msi or hdobbydesk-*.exe
+                if file_name.starts_with("hdobbydesk-")
                     && (file_name.ends_with(".msi") || file_name.ends_with(".exe"))
                 {
                     // Skip files modified within the last hour to avoid deleting files being downloaded
@@ -3813,7 +4155,7 @@ pub fn message_box(text: &str) {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<u16>>();
-    let caption = "RustDesk Output"
+    let caption = "HdobbyDesk Output"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<u16>>();
@@ -3951,8 +4293,8 @@ pub fn release_arch_suffix() -> Option<&'static str> {
     }
 }
 
-pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
-    // Kill rustdesk.exe without extra arg, should only be called by --server
+pub fn try_kill_hdobbydesk_main_window_process() -> ResultType<()> {
+    // Kill hdobbydesk.exe without extra arg, should only be called by --server
     // We can find the exact process which occupies the ipc, see more from https://github.com/winsiderss/systeminformer
     let app_name = crate::get_app_name().to_lowercase();
     log::info!("try kill main window process");
@@ -4000,7 +4342,7 @@ pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
         log::info!("kill process success: {:?}, pid = {:?}", p.cmd(), p.pid());
         return Ok(());
     }
-    bail!("failed to find rustdesk main window process");
+    bail!("failed to find hdobbydesk main window process");
 }
 
 fn nt_terminate_process(process_id: DWORD) -> ResultType<()> {
@@ -4264,7 +4606,7 @@ pub fn send_raw_data_to_printer(printer_name: Option<String>, data: Vec<u8>) -> 
             data.len() as c_ulong,
         );
         if res != 0 {
-            bail!("Failed to send data to the printer, see logs in C:\\Windows\\temp\\test_rustdesk.log for more details.");
+            bail!("Failed to send data to the printer, see logs in C:\\Windows\\temp\\test_hdobbydesk.log for more details.");
         } else {
             log::info!("Successfully sent data to the printer");
         }
@@ -4375,10 +4717,10 @@ fn get_pids_with_args_from_wmic_output<S2: AsRef<str>>(
     // CommandLine=
     // ProcessId=34668
     //
-    // CommandLine="C:\Program Files\RustDesk\RustDesk.exe" --tray
+    // CommandLine="C:\Program Files\HdobbyDesk\HdobbyDesk.exe" --tray
     // ProcessId=13728
     //
-    // CommandLine="C:\Program Files\RustDesk\RustDesk.exe"
+    // CommandLine="C:\Program Files\HdobbyDesk\HdobbyDesk.exe"
     // ProcessId=10136
     let mut pids = Vec::new();
     let mut proc_found = false;

@@ -1,4 +1,8 @@
+#define INITGUID
 #include <windows.h>
+#include <objidl.h>
+#include <wincodec.h>
+#include <algorithm>
 #include <wtsapi32.h>
 #include <tlhelp32.h>
 #include <comdef.h>
@@ -15,11 +19,16 @@
 #include <sddl.h>
 #include <memory>
 
+// MinGW's headers leave this base COM IID in libuuid even with INITGUID,
+// while MSVC's SDK supplies it automatically.
+extern "C" const IID IID_IUnknown = {
+    0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+
 extern "C" uint32_t get_session_user_info(PWSTR bufin, uint32_t nin, uint32_t id);
 
 void flog(char const *fmt, ...)
 {
-    FILE *h = fopen("C:\\Windows\\temp\\test_rustdesk.log", "at");
+    FILE *h = fopen("C:\\Windows\\temp\\test_hdobbydesk.log", "at");
     if (!h)
         return;
     va_list arg;
@@ -37,6 +46,10 @@ static BOOL GetProcessUserName(DWORD processID, LPWSTR outUserName, DWORD inUser
     PTOKEN_USER tokenUser = NULL;
     wchar_t *userName = NULL;
     wchar_t *domainName = NULL;
+    DWORD tokenInfoLength = 0;
+    DWORD userSize = 0;
+    DWORD domainSize = 0;
+    SID_NAME_USE snu;
 
     hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, processID);
     if (hProcess == NULL)
@@ -47,7 +60,6 @@ static BOOL GetProcessUserName(DWORD processID, LPWSTR outUserName, DWORD inUser
     {
         goto cleanup;
     }
-    DWORD tokenInfoLength = 0;
     GetTokenInformation(hToken, TokenUser, NULL, 0, &tokenInfoLength);
     if (tokenInfoLength == 0)
     {
@@ -62,9 +74,6 @@ static BOOL GetProcessUserName(DWORD processID, LPWSTR outUserName, DWORD inUser
     {
         goto cleanup;
     }
-    DWORD userSize = 0;
-    DWORD domainSize = 0;
-    SID_NAME_USE snu;
     LookupAccountSidW(NULL, tokenUser->User.Sid, NULL, &userSize, NULL, &domainSize, &snu);
     if (userSize == 0 || domainSize == 0)
     {
@@ -614,7 +623,7 @@ extern "C"
         {
             if (buf)
             {
-                nout = min(nin, n);
+                nout = std::min(nin, static_cast<uint32_t>(n));
                 memcpy(bufin, buf, nout);
                 WTSFreeMemory(buf);
             }
@@ -631,7 +640,7 @@ extern "C"
         {
             if (buf)
             {
-                nout = min(nin, n);
+                nout = std::min(nin, static_cast<uint32_t>(n));
                 memcpy(bufin, buf, nout);
                 WTSFreeMemory(buf);
             }

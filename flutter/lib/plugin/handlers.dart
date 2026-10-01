@@ -53,23 +53,25 @@ class NativeUiHandler extends NativeHandler {
 
   void onSelectPeers(OnSelectPeersCallbackDart cb, int userData) async {
     showPeerSelectionDialog(onPeersCallback: (peers) {
-      String json = jsonEncode(<String, dynamic> {
-        "peers": peers
-      });
+      String json = jsonEncode(<String, dynamic>{"peers": peers});
       final native = json.toNativeUtf8();
       cb(0, native.cast(), native.length, Pointer.fromAddress(userData));
       malloc.free(native);
     });
   }
-  
-  void onRegisterUiEntry(String title, OnSelectPeersCallbackDart cbFuncDart, int userData) {
+
+  void onRegisterUiEntry(
+      String title, OnSelectPeersCallbackDart cbFuncDart, int userData) {
     Widget widget = InkWell(
       child: Container(
         height: 25.0,
         child: Row(
           children: [
             Expanded(child: Text(title)),
-            Icon(Icons.chevron_right_rounded, size: 12.0,)
+            Icon(
+              Icons.chevron_right_rounded,
+              size: 12.0,
+            )
           ],
         ),
       ),

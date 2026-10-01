@@ -119,6 +119,20 @@ pub async fn connect_service(ms_timeout: u64) -> ResultType<ConnectionTmpl<ConnC
     connect(ms_timeout, crate::POSTFIX_SERVICE).await
 }
 
+#[cfg(target_os = "windows")]
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_service_config(name: &str) -> ResultType<Option<String>> {
+    let ms_timeout = 1_000;
+    let mut c = connect_service(ms_timeout).await?;
+    c.send(&Data::Config((name.to_owned(), None))).await?;
+    if let Some(Data::Config((name2, value))) = c.next_timeout(ms_timeout).await? {
+        if name == name2 {
+            return Ok(value);
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "t", content = "c")]
 pub enum FS {
@@ -743,7 +757,7 @@ async fn handle(data: Data, stream: &mut Connection) {
                 }
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 if crate::is_main() {
-                    // below part is for main windows can be reopen during rustdesk installation and installing service from UI
+                    // below part is for main windows can be reopen during hdobbydesk installation and installing service from UI
                     // this make new ipc server (domain socket) can be created.
                     std::fs::remove_file(&Config::ipc_path("")).ok();
                     #[cfg(target_os = "linux")]
@@ -873,6 +887,23 @@ async fn handle(data: Data, stream: &mut Connection) {
                     value = Some(Config::get_unlock_pin());
                 } else if name == "trusted-devices" {
                     value = Some(Config::get_trusted_devices_json());
+                } else if name == "direct-tls-pairing-code" {
+                    #[cfg(target_os = "windows")]
+                    {
+                        value = match crate::platform::windows::prepare_direct_tls_identity() {
+                            Ok(identity) => Some(identity.pairing_code()),
+                            Err(err) => {
+                                log::error!(
+                                    "Could not prepare the persistent direct TLS identity: {err}"
+                                );
+                                None
+                            }
+                        };
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        value = None;
+                    }
                 } else {
                     value = None;
                 }

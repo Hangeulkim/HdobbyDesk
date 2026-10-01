@@ -209,6 +209,47 @@ enum MessageInput {
     BlockOffPlugin(String),
 }
 
+// Windows requires the thread that blocked input to release it. Keep cleanup
+// on the input thread, including unwinding, and never release another owner's block.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct InputBlockGuard<F: FnMut(bool) -> (bool, String)> {
+    apply: F,
+    active: bool,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl<F: FnMut(bool) -> (bool, String)> InputBlockGuard<F> {
+    fn new(apply: F) -> Self {
+        Self {
+            apply,
+            active: false,
+        }
+    }
+
+    fn set(&mut self, blocked: bool) -> (bool, String) {
+        let result = (self.apply)(blocked);
+        if result.0 {
+            self.active = blocked;
+        }
+        result
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl<F: FnMut(bool) -> (bool, String)> Drop for InputBlockGuard<F> {
+    fn drop(&mut self) {
+        if self.active {
+            let (ok, error) = self.set(false);
+            if !ok {
+                log::error!(
+                    "Failed to restore local input on input-thread exit: {}",
+                    error
+                );
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct SessionKey {
     peer_id: String,
@@ -307,8 +348,8 @@ pub struct Connection {
     server: super::ServerPtrWeak,
     hash: Hash,
     read_jobs: Vec<fs::TransferJob>,
-    timer: crate::RustDeskInterval,
-    file_timer: crate::RustDeskInterval,
+    timer: crate::AppInterval,
+    file_timer: crate::AppInterval,
     file_transfer: Option<(String, bool)>,
     view_camera: bool,
     terminal: bool,
@@ -337,6 +378,12 @@ pub struct Connection {
     // by peer
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     show_my_cursor: bool,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    collaborative_cursor: bool,
+    #[cfg(target_os = "windows")]
+    keyboard_gamepad: bool,
+    #[cfg(target_os = "windows")]
+    keyboard_gamepad_mapper: super::keyboard_gamepad::KeyboardGamepadMapper,
     // by peer
     disable_clipboard: bool,
     // by peer
@@ -447,6 +494,9 @@ const MILLI1: Duration = Duration::from_millis(1);
 const SEND_TIMEOUT_VIDEO: u64 = 12_000;
 const SEND_TIMEOUT_OTHER: u64 = SEND_TIMEOUT_VIDEO * 10;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+// Direct TLS authenticates the host, not the connecting user. Bound unauthenticated
+// frames and waiting time independently of incoming keepalive traffic.
+const DIRECT_LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl Connection {
     pub async fn start(
@@ -456,6 +506,7 @@ impl Connection {
         server: super::ServerPtrWeak,
         meta: super::ConnectionMeta,
     ) {
+        let is_direct_tls = matches!(&stream, super::Stream::DirectTls(_));
         let super::ConnectionMeta {
             control_permissions,
             controlled_context,
@@ -508,8 +559,8 @@ impl Connection {
             server,
             hash,
             read_jobs: Vec::new(),
-            timer: crate::rustdesk_interval(time::interval(SEC30)),
-            file_timer: crate::rustdesk_interval(time::interval(SEC30)),
+            timer: crate::app_interval(time::interval(SEC30)),
+            file_timer: crate::app_interval(time::interval(SEC30)),
             file_transfer: None,
             view_camera: false,
             terminal: false,
@@ -542,6 +593,12 @@ impl Connection {
             disable_keyboard: false,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             show_my_cursor: false,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            collaborative_cursor: false,
+            #[cfg(target_os = "windows")]
+            keyboard_gamepad: false,
+            #[cfg(target_os = "windows")]
+            keyboard_gamepad_mapper: Default::default(),
             tx_input,
             video_ack_required: false,
             server_audit_conn: "".to_owned(),
@@ -630,7 +687,7 @@ impl Connection {
             conn.send_permission(Permission::PrivacyMode, false).await;
         }
         let mut test_delay_timer =
-            crate::rustdesk_interval(time::interval_at(Instant::now(), TEST_DELAY_TIMEOUT));
+            crate::app_interval(time::interval_at(Instant::now(), TEST_DELAY_TIMEOUT));
         let mut last_recv_time = Instant::now();
 
         conn.stream.set_send_timeout(
@@ -643,7 +700,7 @@ impl Connection {
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         std::thread::spawn(move || Self::handle_input(_rx_input, tx_cloned));
-        let mut second_timer = crate::rustdesk_interval(time::interval(Duration::from_secs(1)));
+        let mut second_timer = crate::app_interval(time::interval(Duration::from_secs(1)));
 
         #[cfg(feature = "unix-file-copy-paste")]
         let rx_clip_holder;
@@ -667,9 +724,16 @@ impl Connection {
             (_tx_clip, rx_clip) = mpsc::unbounded_channel::<i32>();
         }
 
+        let authorization_deadline = time::sleep(DIRECT_LOGIN_TIMEOUT);
+        tokio::pin!(authorization_deadline);
         loop {
             tokio::select! {
                 // biased; // video has higher priority // causing test_delay_timer failed while transferring big file
+
+                _ = &mut authorization_deadline, if is_direct_tls && !conn.authorized => {
+                    conn.on_close("Authorization timeout", false).await;
+                    break;
+                }
 
                 Some(data) = rx_from_cm.recv() => {
                     match data {
@@ -969,7 +1033,7 @@ impl Connection {
                             }
                         }
                     } else {
-                        conn.file_timer = crate::rustdesk_interval(time::interval_at(Instant::now() + SEC30, SEC30));
+                        conn.file_timer = crate::app_interval(time::interval_at(Instant::now() + SEC30, SEC30));
                     }
                 }
                 Ok(conns) = hbbs_rx.recv() => {
@@ -1156,7 +1220,7 @@ impl Connection {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn handle_input(receiver: std_mpsc::Receiver<MessageInput>, tx: Sender) {
-        let mut block_input_mode = false;
+        let mut input_block = InputBlockGuard::new(crate::platform::block_input);
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             rdev::set_mouse_extra_info(enigo::ENIGO_INPUT_EXTRA_VALUE);
@@ -1193,10 +1257,8 @@ impl Connection {
                         handle_pointer(&msg, id);
                     }
                     MessageInput::BlockOn => {
-                        let (ok, msg) = crate::platform::block_input(true);
-                        if ok {
-                            block_input_mode = true;
-                        } else {
+                        let (ok, msg) = input_block.set(true);
+                        if !ok {
                             Self::send_block_input_error(
                                 &tx,
                                 back_notification::BlockInputState::BlkOnFailed,
@@ -1205,10 +1267,8 @@ impl Connection {
                         }
                     }
                     MessageInput::BlockOff => {
-                        let (ok, msg) = crate::platform::block_input(false);
-                        if ok {
-                            block_input_mode = false;
-                        } else {
+                        let (ok, msg) = input_block.set(false);
+                        if !ok {
                             Self::send_block_input_error(
                                 &tx,
                                 back_notification::BlockInputState::BlkOffFailed,
@@ -1219,37 +1279,30 @@ impl Connection {
                     #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     MessageInput::BlockOnPlugin(_peer) => {
-                        let (ok, _msg) = crate::platform::block_input(true);
-                        if ok {
-                            block_input_mode = true;
-                        }
+                        let _ = input_block.set(true);
                         let _r = PLUGIN_BLOCK_INPUT_TX_RX
                             .0
                             .lock()
                             .unwrap()
-                            .send(block_input_mode);
+                            .send(input_block.active);
                     }
                     #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     MessageInput::BlockOffPlugin(_peer) => {
-                        let (ok, _msg) = crate::platform::block_input(false);
-                        if ok {
-                            block_input_mode = false;
-                        }
+                        let _ = input_block.set(false);
                         let _r = PLUGIN_BLOCK_INPUT_TX_RX
                             .0
                             .lock()
                             .unwrap()
-                            .send(block_input_mode);
+                            .send(input_block.active);
                     }
                 },
                 Err(err) => {
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    if block_input_mode {
-                        let _ = crate::platform::block_input(true);
-                    }
                     if std_mpsc::RecvTimeoutError::Disconnected == err {
                         break;
+                    }
+                    if input_block.active {
+                        let _ = input_block.set(true);
                     }
                 }
             }
@@ -1655,6 +1708,10 @@ impl Connection {
             return false;
         }
         self.authorized = true;
+        if let super::Stream::DirectTls(framed) = &mut self.stream {
+            // Authenticated video/clipboard/file messages retain their existing limits.
+            framed.0.codec_mut().set_max_packet_length(usize::MAX);
+        }
         let (conn_type, auth_conn_type) = if self.file_transfer.is_some() {
             (1, AuthConnType::FileTransfer)
         } else if self.port_forward_socket.is_some() {
@@ -1732,12 +1789,23 @@ impl Connection {
                 "is_installed".into(),
                 json!(crate::platform::is_installed()),
             );
+            let session_scope = match crate::platform::is_physical_console_session() {
+                Some(true) => "physical_console",
+                Some(false) => "separate_desktop",
+                None => "unknown",
+            };
+            platform_additions.insert("windows_session_scope".into(), json!(session_scope));
             if crate::platform::is_installed() {
                 platform_additions.extend(virtual_display_manager::get_platform_additions());
             }
             platform_additions.insert(
                 "supported_privacy_mode_impl".into(),
                 json!(privacy_mode::get_supported_privacy_mode_impl()),
+            );
+            platform_additions.insert("keyboard_gamepad".into(), json!(true));
+            platform_additions.insert(
+                "keyboard_gamepad_ready".into(),
+                json!(super::virtual_gamepad::driver_available()),
             );
         }
         #[cfg(target_os = "macos")]
@@ -1747,6 +1815,8 @@ impl Connection {
                 json!(privacy_mode::get_supported_privacy_mode_impl()),
             );
         }
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+        platform_additions.insert("collaborative_cursor".into(), json!(true));
 
         #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
         {
@@ -2175,6 +2245,66 @@ impl Connection {
                 show_cursor,
             }))
             .ok();
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn release_collaborative_buttons(&self, buttons: impl IntoIterator<Item = i32>) {
+        for button in buttons {
+            if button <= 0 {
+                continue;
+            }
+            let mut release = MouseEvent::new();
+            release.mask = crate::input::MOUSE_TYPE_UP | (button << 3);
+            self.input_mouse(
+                release,
+                self.inner.id(),
+                self.lr.my_name.clone(),
+                self.peer_argb,
+                true,
+                false,
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn input_collaborative_mouse(&self, mut msg: MouseEvent) {
+        use super::collaborative_input::PointerAction;
+
+        let event_type = msg.mask & crate::input::MOUSE_TYPE_MASK;
+        let button = msg.mask >> 3;
+        let action = match event_type {
+            crate::input::MOUSE_TYPE_MOVE => PointerAction::Move,
+            crate::input::MOUSE_TYPE_DOWN if button > 0 => PointerAction::Down(button),
+            crate::input::MOUSE_TYPE_UP if button > 0 => PointerAction::Up(button),
+            crate::input::MOUSE_TYPE_WHEEL | crate::input::MOUSE_TYPE_TRACKPAD => {
+                PointerAction::Scroll
+            }
+            crate::input::MOUSE_TYPE_MOVE_RELATIVE => PointerAction::RelativeMove,
+            _ => return,
+        };
+        let decision =
+            super::collaborative_input::decide_pointer(self.inner.id(), action, msg.x, msg.y);
+        self.release_collaborative_buttons(decision.release_stale_buttons);
+        if let Some((x, y)) = decision.move_before_action {
+            msg.x = x;
+            msg.y = y;
+            msg.position_valid = true;
+        }
+        self.input_mouse(
+            msg,
+            self.inner.id(),
+            self.lr.my_name.clone(),
+            self.peer_argb,
+            decision.simulate,
+            true,
+        );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn clear_collaborative_pointer(&self) {
+        self.release_collaborative_buttons(super::collaborative_input::clear_connection(
+            self.inner.id(),
+        ));
     }
 
     #[inline]
@@ -2855,14 +2985,18 @@ impl Connection {
                         }
                         #[cfg(target_os = "macos")]
                         self.retina.on_mouse_event(&mut me, self.display_idx);
-                        self.input_mouse(
-                            me,
-                            self.inner.id(),
-                            self.lr.my_name.clone(),
-                            self.peer_argb,
-                            true,
-                            self.show_my_cursor,
-                        );
+                        if self.collaborative_cursor {
+                            self.input_collaborative_mouse(me);
+                        } else {
+                            self.input_mouse(
+                                me,
+                                self.inner.id(),
+                                self.lr.my_name.clone(),
+                                self.peer_argb,
+                                true,
+                                self.show_my_cursor,
+                            );
+                        }
                     } else if self.show_my_cursor {
                         #[cfg(target_os = "macos")]
                         self.retina.on_mouse_event(&mut me, self.display_idx);
@@ -2978,7 +3112,28 @@ impl Connection {
                     if self.is_authed_view_camera_conn() {
                         return true;
                     }
-                    if self.peer_keyboard_enabled() {
+                    #[cfg(target_os = "windows")]
+                    let gamepad_consumed = self.keyboard_gamepad;
+                    #[cfg(not(target_os = "windows"))]
+                    let gamepad_consumed = false;
+
+                    #[cfg(target_os = "windows")]
+                    if gamepad_consumed {
+                        for report in self.keyboard_gamepad_mapper.apply_event(&me) {
+                            if let Err(error) =
+                                super::virtual_gamepad::update(self.inner.id(), report)
+                            {
+                                log::error!(
+                                    "Failed to update keyboard gamepad for connection {}: {}",
+                                    self.inner.id(),
+                                    error
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    if !gamepad_consumed && self.peer_keyboard_enabled() {
                         if is_enter(&me) {
                             CLICK_TIME.store(get_time(), Ordering::SeqCst);
                         }
@@ -3296,7 +3451,7 @@ impl Connection {
                             Some(file_action::Union::Receive(r)) => {
                                 // client to server
                                 // note: 1.1.10 introduced identical file detection, which breaks original logic of send/recv files
-                                // whenever got send/recv request, check peer version to ensure old version of rustdesk
+                                // whenever got send/recv request, check peer version to ensure old version of hdobbydesk
                                 let od = can_enable_overwrite_detection(get_version_number(
                                     &self.lr.version,
                                 ));
@@ -4315,7 +4470,7 @@ impl Connection {
                     let name = display.name();
                     #[cfg(windows)]
                     if let Some(_ok) =
-                        virtual_display_manager::rustdesk_idd::change_resolution_if_is_virtual_display(
+                        virtual_display_manager::hdobbydesk_idd::change_resolution_if_is_virtual_display(
                             &name,
                             r.width as _,
                             r.height as _,
@@ -4636,10 +4791,95 @@ impl Connection {
                     }
                 } else {
                     if not_support_msg.is_empty() {
-                        whiteboard::unregister_whiteboard(whiteboard::get_key_cursor(
-                            self.inner.id,
-                        ));
+                        if !self.collaborative_cursor {
+                            whiteboard::unregister_whiteboard(whiteboard::get_key_cursor(
+                                self.inner.id,
+                            ));
+                        }
                     }
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Ok(q) = o.collaborative_cursor.enum_value() {
+            if q != BoolOption::NotSet {
+                use crate::whiteboard;
+                let enabled = q == BoolOption::Yes;
+                if self.collaborative_cursor && !enabled {
+                    self.clear_collaborative_pointer();
+                }
+                self.collaborative_cursor = enabled;
+                if enabled {
+                    whiteboard::register_whiteboard(whiteboard::get_key_cursor(self.inner.id));
+                } else if !self.show_my_cursor {
+                    whiteboard::unregister_whiteboard(whiteboard::get_key_cursor(self.inner.id));
+                }
+            }
+        }
+        if let Ok(q) = o.keyboard_gamepad.enum_value() {
+            if q != BoolOption::NotSet {
+                #[cfg(target_os = "windows")]
+                {
+                    let requested = q == BoolOption::Yes;
+                    if requested && !self.peer_keyboard_enabled() {
+                        let mut msg_out = Message::new();
+                        msg_out.set_message_box(MessageBox {
+                            msgtype: "nook-nocancel-hasclose".to_owned(),
+                            title: "Keyboard gamepad".to_owned(),
+                            text: "Keyboard control permission is required.".to_owned(),
+                            ..Default::default()
+                        });
+                        self.send(msg_out).await;
+                    } else if requested {
+                        if let Some(neutral) = self.keyboard_gamepad_mapper.neutralize() {
+                            let _ = super::virtual_gamepad::update(self.inner.id(), neutral);
+                        }
+                        match super::virtual_gamepad::enable(self.inner.id()) {
+                            Ok(user_index) => {
+                                self.keyboard_gamepad = true;
+                                let mut msg_out = Message::new();
+                                msg_out.set_message_box(MessageBox {
+                                    msgtype: "info-nocancel-hasclose".to_owned(),
+                                    title: "Keyboard gamepad".to_owned(),
+                                    text: format!(
+                                        "This connection now controls virtual gamepad {}.",
+                                        user_index + 1
+                                    ),
+                                    ..Default::default()
+                                });
+                                self.send(msg_out).await;
+                            }
+                            Err(error) => {
+                                self.keyboard_gamepad = false;
+                                super::virtual_gamepad::disable(self.inner.id());
+                                let mut msg_out = Message::new();
+                                msg_out.set_message_box(MessageBox {
+                                    msgtype: "error-nocancel-hasclose".to_owned(),
+                                    title: "Keyboard gamepad unavailable".to_owned(),
+                                    text: error,
+                                    ..Default::default()
+                                });
+                                self.send(msg_out).await;
+                            }
+                        }
+                    } else {
+                        if let Some(neutral) = self.keyboard_gamepad_mapper.neutralize() {
+                            let _ = super::virtual_gamepad::update(self.inner.id(), neutral);
+                        }
+                        super::virtual_gamepad::disable(self.inner.id());
+                        self.keyboard_gamepad = false;
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                if q == BoolOption::Yes {
+                    let mut msg_out = Message::new();
+                    msg_out.set_message_box(MessageBox {
+                        msgtype: "nook-nocancel-hasclose".to_owned(),
+                        title: "Keyboard gamepad".to_owned(),
+                        text: "A Windows host is required.".to_owned(),
+                        ..Default::default()
+                    });
+                    self.send(msg_out).await;
                 }
             }
         }
@@ -4992,7 +5232,7 @@ impl Connection {
         job.is_remote = true;
         job.conn_id = self.inner.id();
         self.read_jobs.push(job);
-        self.file_timer = crate::rustdesk_interval(time::interval(MILLI1));
+        self.file_timer = crate::app_interval(time::interval(MILLI1));
         let audit_path = if job_type == fs::JobType::Printer {
             "Remote print".to_owned()
         } else {
@@ -5454,6 +5694,8 @@ impl Connection {
             && Self::is_bool_option_not_set(option.disable_camera)
             && Self::is_bool_option_not_set(option.terminal_persistent)
             && Self::is_bool_option_not_set(option.show_my_cursor)
+            && Self::is_bool_option_not_set(option.collaborative_cursor)
+            && Self::is_bool_option_not_set(option.keyboard_gamepad)
     }
 
     fn is_connection_housekeeping_message(msg: &Message) -> bool {
@@ -5588,7 +5830,9 @@ impl Connection {
             && Self::is_bool_option_not_set(option.follow_remote_window)
             && Self::is_bool_option_not_set(option.disable_camera)
             && Self::is_bool_option_not_set(option.terminal_persistent)
-            && Self::is_bool_option_not_set(option.show_my_cursor))
+            && Self::is_bool_option_not_set(option.show_my_cursor)
+            && Self::is_bool_option_not_set(option.collaborative_cursor)
+            && Self::is_bool_option_not_set(option.keyboard_gamepad))
     }
 
     fn option_has_non_terminal_login_field(option: &OptionMessage) -> bool {
@@ -5608,6 +5852,8 @@ impl Connection {
             || !Self::is_bool_option_not_set(option.follow_remote_window)
             || !Self::is_bool_option_not_set(option.disable_camera)
             || !Self::is_bool_option_not_set(option.show_my_cursor)
+            || !Self::is_bool_option_not_set(option.collaborative_cursor)
+            || !Self::is_bool_option_not_set(option.keyboard_gamepad)
     }
 
     fn option_has_any_field(option: &OptionMessage) -> bool {
@@ -5698,7 +5944,7 @@ impl Connection {
     #[cfg(all(target_os = "windows", feature = "flutter"))]
     async fn send_printer_request(&mut self, data: Vec<u8>) {
         // This path is only used to identify the printer job.
-        let path = format!("RustDesk://FsJob//Printer/{}", get_time());
+        let path = format!("HdobbyDesk://FsJob//Printer/{}", get_time());
 
         let msg = fs::new_send(0, fs::JobType::Printer, path.clone(), 1, false);
         self.send(msg).await;
@@ -6267,6 +6513,15 @@ impl Default for PortableState {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(neutral) = self.keyboard_gamepad_mapper.neutralize() {
+                let _ = super::virtual_gamepad::update(self.inner.id(), neutral);
+            }
+            super::virtual_gamepad::disable(self.inner.id());
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        self.clear_collaborative_pointer();
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         self.release_pressed_modifiers();
 
@@ -6679,6 +6934,83 @@ mod test {
     #[allow(unused)]
     use super::*;
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn hdobby_input_block_releases_on_owner_thread_exit() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let owner = std::thread::current().id();
+        {
+            let mut guard = InputBlockGuard::new(|blocked| {
+                assert_eq!(std::thread::current().id(), owner);
+                calls.borrow_mut().push(blocked);
+                (true, String::new())
+            });
+            assert!(guard.set(true).0);
+        }
+        assert_eq!(*calls.borrow(), vec![true, false]);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn hdobby_input_block_preserves_other_owners_and_avoids_duplicate_release() {
+        for block_succeeds in [false, true] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            {
+                let mut guard = InputBlockGuard::new(|blocked| {
+                    calls.borrow_mut().push(blocked);
+                    (!blocked || block_succeeds, String::new())
+                });
+                assert_eq!(guard.set(true).0, block_succeeds);
+                if block_succeeds {
+                    assert!(guard.set(false).0);
+                }
+            }
+            assert_eq!(
+                *calls.borrow(),
+                if block_succeeds {
+                    vec![true, false]
+                } else {
+                    vec![true]
+                }
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn hdobby_input_block_retries_failed_release_once_on_exit() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        {
+            let mut guard = InputBlockGuard::new(|blocked| {
+                let mut calls = calls.borrow_mut();
+                calls.push(blocked);
+                (
+                    blocked || calls.len() == 3,
+                    "test-only release failure".to_owned(),
+                )
+            });
+            assert!(guard.set(true).0);
+            assert!(!guard.set(false).0);
+        }
+        assert_eq!(*calls.borrow(), vec![true, false, false]);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn hdobby_input_block_releases_during_unwinding() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = InputBlockGuard::new(|blocked| {
+                calls.borrow_mut().push(blocked);
+                (true, String::new())
+            });
+            assert!(guard.set(true).0);
+            panic!("test-only input worker failure");
+        }));
+        assert!(result.is_err());
+        assert_eq!(*calls.borrow(), vec![true, false]);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn retina() {
@@ -6956,6 +7288,7 @@ mod test {
         option.disable_audio = BoolOption::Yes.into();
         option.block_input = BoolOption::Yes.into();
         option.privacy_mode = BoolOption::Yes.into();
+        option.keyboard_gamepad = BoolOption::Yes.into();
 
         let (scoped, violation) =
             Connection::scoped_login_option(AuthConnType::ViewCamera, &option);
@@ -6968,6 +7301,10 @@ mod test {
         assert_eq!(scoped.disable_audio.enum_value(), Ok(BoolOption::Yes));
         assert_eq!(scoped.block_input.enum_value(), Ok(BoolOption::NotSet));
         assert_eq!(scoped.privacy_mode.enum_value(), Ok(BoolOption::NotSet));
+        assert_eq!(
+            scoped.keyboard_gamepad.enum_value(),
+            Ok(BoolOption::NotSet)
+        );
 
         let (scoped, violation) =
             Connection::scoped_login_option(AuthConnType::FileTransfer, &option);

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=HdobbyDesk
+NoDisplay=true
+MimeType=x-scheme-handler/hdobbydesk;
+TryExec=hdobbydesk
+Exec=hdobbydesk %u
+Icon=hdobbydesk
+Terminal=false
+Type=Application
+StartupNotify=false
+StartupWMClass=hdobbydesk

@@ -47,6 +47,45 @@ pub type FlutterSession = Arc<Session<FlutterHandler>>;
 lazy_static::lazy_static! {
     pub(crate) static ref CUR_SESSION_ID: RwLock<SessionID> = Default::default(); // For desktop only
     static ref GLOBAL_EVENT_STREAM: RwLock<HashMap<String, StreamSink<String>>> = Default::default(); // rust to dart event channel
+    static ref IOS_CLIPBOARD_PAYLOADS: RwLock<HashMap<String, crate::ios_clipboard::IosClipboardPayload>> = Default::default();
+}
+
+#[cfg(target_os = "ios")]
+const MAX_PENDING_IOS_CLIPBOARDS: usize = 8;
+
+#[cfg(target_os = "ios")]
+fn store_ios_clipboard_payload(payload: crate::ios_clipboard::IosClipboardPayload) -> String {
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut payloads = IOS_CLIPBOARD_PAYLOADS.write().unwrap();
+    if payloads.len() >= MAX_PENDING_IOS_CLIPBOARDS {
+        if let Some(oldest) = payloads.keys().next().cloned() {
+            payloads.remove(&oldest);
+        }
+    }
+    payloads.insert(token.clone(), payload);
+    token
+}
+
+pub fn get_ios_clipboard_text(token: &str) -> String {
+    IOS_CLIPBOARD_PAYLOADS
+        .read()
+        .unwrap()
+        .get(token)
+        .map(|payload| payload.text.clone())
+        .unwrap_or_default()
+}
+
+pub fn get_ios_clipboard_png(token: &str) -> Vec<u8> {
+    IOS_CLIPBOARD_PAYLOADS
+        .read()
+        .unwrap()
+        .get(token)
+        .map(|payload| payload.png.clone())
+        .unwrap_or_default()
+}
+
+pub fn clear_ios_clipboard_payload(token: &str) {
+    IOS_CLIPBOARD_PAYLOADS.write().unwrap().remove(token);
 }
 
 #[cfg(target_os = "windows")]
@@ -99,11 +138,11 @@ fn load_plugin_in_app_path(dll_name: &str) -> Result<Library, LibError> {
     }
 }
 
-/// FFI for rustdesk core's main entry.
+/// FFI for hdobbydesk core's main entry.
 /// Return true if the app should continue running with UI(possibly Flutter), false if the app should exit.
 #[cfg(not(windows))]
 #[no_mangle]
-pub extern "C" fn rustdesk_core_main() -> bool {
+pub extern "C" fn hdobbydesk_core_main() -> bool {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if crate::core_main::core_main().is_some() {
         return true;
@@ -123,17 +162,26 @@ pub extern "C" fn handle_applicationShouldOpenUntitledFile() {
 
 #[cfg(windows)]
 #[no_mangle]
-pub extern "C" fn rustdesk_core_main_args(args_len: *mut c_int) -> *mut *mut c_char {
+pub extern "C" fn hdobbydesk_core_main_args(args_len: *mut c_int) -> *mut *mut c_char {
     unsafe { std::ptr::write(args_len, 0) };
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         if let Some(args) = crate::core_main::core_main() {
+            crate::platform::windows::schedule_management_window_capture_protection();
             return rust_args_to_c_args(args, args_len);
         }
         return std::ptr::null_mut() as _;
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     return std::ptr::null_mut() as _;
+}
+
+// Keep the ABI expected by the previously installed Windows Flutter runner.
+// This can be removed when the matching HdobbyDesk runner is deployed.
+#[cfg(windows)]
+#[no_mangle]
+pub extern "C" fn rustdesk_core_main_args(args_len: *mut c_int) -> *mut *mut c_char {
+    hdobbydesk_core_main_args(args_len)
 }
 
 // https://gist.github.com/iskakaushik/1c5b8aa75c77479c33c4320913eebef6
@@ -188,13 +236,19 @@ pub unsafe extern "C" fn free_c_args(ptr: *mut *mut c_char, len: c_int) {
 
 #[cfg(windows)]
 #[no_mangle]
-pub unsafe extern "C" fn get_rustdesk_app_name(buffer: *mut u16, length: i32) -> i32 {
+pub unsafe extern "C" fn get_hdobbydesk_app_name(buffer: *mut u16, length: i32) -> i32 {
     let name = crate::platform::wide_string(&crate::get_app_name());
     if length > name.len() as i32 {
         std::ptr::copy_nonoverlapping(name.as_ptr(), buffer, name.len());
         return 0;
     }
     -1
+}
+
+#[cfg(windows)]
+#[no_mangle]
+pub unsafe extern "C" fn get_rustdesk_app_name(buffer: *mut u16, length: i32) -> i32 {
+    get_hdobbydesk_app_name(buffer, length)
 }
 
 #[derive(Default)]
@@ -672,6 +726,7 @@ impl InvokeUiSession for FlutterHandler {
                 ("hoty", &cd.hoty.to_string()),
                 ("width", &cd.width.to_string()),
                 ("height", &cd.height.to_string()),
+                ("text_input_cursor", &cd.text_input_cursor.to_string()),
                 (
                     "colors",
                     &serde_json::ser::to_string(&colors).unwrap_or("".to_owned()),
@@ -1051,9 +1106,30 @@ impl InvokeUiSession for FlutterHandler {
         );
     }
 
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(target_os = "android")]
     fn clipboard(&self, content: String) {
         self.push_event("clipboard", &[("content", &content)], &[]);
+    }
+
+    #[cfg(target_os = "ios")]
+    fn clipboard(&self, clipboards: Vec<Clipboard>) {
+        match crate::ios_clipboard::decode_incoming_clipboards(clipboards) {
+            Ok(payload) => {
+                let has_text = (!payload.text.is_empty()).to_string();
+                let has_png = (!payload.png.is_empty()).to_string();
+                let token = store_ios_clipboard_payload(payload);
+                self.push_event(
+                    "ios_clipboard",
+                    &[
+                        ("token", &token),
+                        ("has_text", &has_text),
+                        ("has_png", &has_png),
+                    ],
+                    &[],
+                );
+            }
+            Err(error) => log::warn!("Rejected incoming iOS clipboard: {error}"),
+        }
     }
 
     fn switch_back(&self, peer_id: &str) {
@@ -1483,6 +1559,41 @@ pub fn send_clipboard_msg(msg: Message, _is_file: bool) {
             s.send(Data::Message(msg.clone()));
         }
     }
+}
+
+pub fn send_ios_clipboard(
+    session_id: &SessionID,
+    text: String,
+    png: Vec<u8>,
+) -> Result<(), &'static str> {
+    use crate::ios_clipboard::{
+        build_outgoing_message, peer_supports_multi_clipboard, IOS_CLIPBOARD_DISABLED,
+        IOS_CLIPBOARD_IMAGE_UNSUPPORTED, IOS_CLIPBOARD_SESSION_UNAVAILABLE,
+    };
+
+    let has_png = !png.is_empty();
+    let message = build_outgoing_message(text, png)?;
+    let session = sessions::get_session_by_session_id(session_id)
+        .ok_or(IOS_CLIPBOARD_SESSION_UNAVAILABLE)?;
+    if !session
+        .connection_round_state
+        .lock()
+        .unwrap()
+        .is_connected()
+    {
+        return Err(IOS_CLIPBOARD_SESSION_UNAVAILABLE);
+    }
+    if !session.is_default() || !session.is_text_clipboard_required() {
+        return Err(IOS_CLIPBOARD_DISABLED);
+    }
+    if has_png {
+        let peer_info = session.ui_handler.peer_info.read().unwrap();
+        if !peer_supports_multi_clipboard(&peer_info.version, &peer_info.platform) {
+            return Err(IOS_CLIPBOARD_IMAGE_UNSUPPORTED);
+        }
+    }
+    session.send(Data::Message(message));
+    Ok(())
 }
 
 // Server Side

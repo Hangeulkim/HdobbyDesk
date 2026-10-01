@@ -6,7 +6,7 @@ use hbb_common::{
 };
 use serde_derive::{Deserialize, Serialize};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 use utf16string::WStr;
@@ -20,6 +20,82 @@ pub enum FileType {
     Directory,
     // todo: support symlink
     Symlink,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(name: &str, timestamp: u64) -> Vec<u8> {
+        let mut data = vec![0; 4 + 592];
+        data[..4].copy_from_slice(&1u32.to_le_bytes());
+        data[4..8].copy_from_slice(&(FLAGS_FD_ATTRIBUTES | FLAGS_FD_LAST_WRITE).to_le_bytes());
+        data[40..44].copy_from_slice(&0x80u32.to_le_bytes());
+        data[60..68].copy_from_slice(&timestamp.to_le_bytes());
+        for (i, c) in name.encode_utf16().enumerate() {
+            data[76 + i * 2..78 + i * 2].copy_from_slice(&c.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn rejects_file_descriptor_path_escapes() {
+        for name in [
+            "../escape",
+            "sub/../../out",
+            "/outside",
+            "\\\\server\\share",
+            "C:\\outside",
+            "C:outside",
+            "sub\\..\\out",
+            "",
+            ".",
+            "sub//file",
+            "sub/./file",
+            "safe\0hidden",
+        ] {
+            assert!(
+                FileDescription::parse_file_descriptors(descriptor(name, 0), 1).is_err(),
+                "accepted {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_filetime_does_not_overflow() {
+        let files =
+            FileDescription::parse_file_descriptors(descriptor("valid.txt", u64::MAX), 1).unwrap();
+        let duration = files[0]
+            .last_modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(
+            duration.as_secs(),
+            (u64::MAX - LDAP_EPOCH_DELTA) / 10_000_000
+        );
+    }
+
+    #[test]
+    fn preserves_nested_unicode_and_checks_descriptor_length() {
+        let files = FileDescription::parse_file_descriptors(
+            descriptor("한글 폴더\\🙂.txt", LDAP_EPOCH_DELTA + 12_345_678),
+            1,
+        )
+        .unwrap();
+        assert_eq!(files[0].name, PathBuf::from("한글 폴더/🙂.txt"));
+        assert_eq!(
+            files[0]
+                .last_modified
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap(),
+            Duration::new(1, 234_567_800)
+        );
+        assert!(FileDescription::parse_file_descriptors(vec![255; 4], 1).is_err());
+        assert!(FileDescription::parse_file_descriptors(vec![0; 3], 1).is_err());
+        assert!(FileDescription::parse_file_descriptors(vec![0; 4], 1)
+            .unwrap()
+            .is_empty());
+    }
 }
 
 /// read only permission
@@ -45,6 +121,26 @@ pub struct FileDescription {
     pub creation_time: SystemTime,
     pub size: u64,
     pub perm: u16,
+}
+
+pub(super) fn validate_relative_path(path: &Path) -> std::io::Result<()> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid clipboard file path",
+        )
+    };
+    let name = path.to_str().ok_or_else(invalid)?;
+    if name.is_empty()
+        || name.contains(['\0', '\\', ':'])
+        || name
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || path.is_absolute()
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 impl FileDescription {
@@ -128,15 +224,22 @@ impl FileDescription {
 
         let valid_write_time = flags & FLAGS_FD_LAST_WRITE != 0;
         let last_modified = if valid_write_time && last_write_time >= LDAP_EPOCH_DELTA {
-            let last_write_time = (last_write_time - LDAP_EPOCH_DELTA) * 100;
-            let last_write_time = Duration::from_nanos(last_write_time);
-            SystemTime::UNIX_EPOCH + last_write_time
+            let ticks = last_write_time - LDAP_EPOCH_DELTA;
+            let duration = Duration::new(ticks / 10_000_000, ((ticks % 10_000_000) * 100) as u32);
+            SystemTime::UNIX_EPOCH
+                .checked_add(duration)
+                .ok_or_else(|| CliprdrError::InvalidRequest {
+                    description: "file descriptor timestamp out of range".to_owned(),
+                })?
         } else {
             SystemTime::UNIX_EPOCH
         };
 
         let name = wstr.to_utf8().replace('\\', "/");
         let name = PathBuf::from(name.trim_end_matches('\0'));
+        validate_relative_path(&name).map_err(|_| CliprdrError::InvalidRequest {
+            description: "invalid clipboard file path".to_owned(),
+        })?;
 
         let desc = FileDescription {
             conn_id,
@@ -171,7 +274,7 @@ impl FileDescription {
             return Ok(Vec::new());
         }
 
-        if data.remaining() != 592 * count {
+        if count > 65_536 || count.checked_mul(592) != Some(data.remaining()) {
             return Err(CliprdrError::InvalidRequest {
                 description: "file descriptor request with invalid length".to_string(),
             });

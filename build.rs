@@ -1,11 +1,26 @@
-#[cfg(windows)]
 fn build_windows() {
     let file = "src/platform/windows.cc";
     let file2 = "src/platform/windows_delete_test_cert.cc";
-    cc::Build::new().file(file).file(file2).compile("windows");
+    let vigem_client = "third_party/ViGEmClient/src/ViGEmClient.cpp";
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .flag_if_supported("-fpermissive")
+        .flag_if_supported("-Wno-narrowing")
+        .flag_if_supported("-std=c++17")
+        .include("third_party/ViGEmClient/include")
+        .include("third_party/ViGEmClient/src")
+        .file(file)
+        .file(file2)
+        .file(vigem_client)
+        .compile("windows");
     println!("cargo:rustc-link-lib=WtsApi32");
+    println!("cargo:rustc-link-lib=uuid");
+    println!("cargo:rustc-link-lib=setupapi");
     println!("cargo:rerun-if-changed={}", file);
     println!("cargo:rerun-if-changed={}", file2);
+    println!("cargo:rerun-if-changed={}", vigem_client);
+    println!("cargo:rerun-if-changed=third_party/ViGEmClient/include");
 }
 
 #[cfg(target_os = "macos")]
@@ -82,9 +97,10 @@ fn main() {
     install_android_deps();
     #[cfg(all(windows, feature = "inline"))]
     build_manifest();
-    #[cfg(windows)]
-    build_windows();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+    if target_os == "windows" {
+        build_windows();
+    }
     if target_os == "macos" {
         #[cfg(target_os = "macos")]
         build_mac();

@@ -9,9 +9,11 @@ import 'package:flutter_hbb/common/widgets/dialog.dart';
 import 'package:flutter_hbb/common/widgets/login.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
+import 'package:flutter_hbb/hdobby/ios_clipboard.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
+import 'package:hdobby_input/windows_session_choice.dart';
 import 'package:get/get.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -20,6 +22,108 @@ const String kPeerOptionAllowWaylandKeyboard = 'allow-wayland-keyboard';
 const String kWaylandKeyboardIssueUrl =
     'https://github.com/rustdesk/rustdesk/issues/14586';
 final Set<String> _waylandKeyboardPromptSuppressedConnectionIds = <String>{};
+
+WindowsRemoteSessionScope windowsRemoteSessionScope(FFI ffi) {
+  final pi = ffi.ffiModel.pi;
+  if (ffi.connType != ConnType.defaultConn ||
+      pi.platform != kPeerPlatformWindows) {
+    return WindowsRemoteSessionScope.unknown;
+  }
+  return parseWindowsRemoteSessionScope(
+      pi.platformAdditions[kPlatformAdditionsWindowsSessionScope]);
+}
+
+String _windowsSessionScopeLabel(WindowsRemoteSessionScope scope) {
+  return translate(scope == WindowsRemoteSessionScope.physicalConsole
+      ? 'Physical monitor'
+      : 'Separate desktop');
+}
+
+String _windowsSessionScopeMessage(WindowsRemoteSessionScope scope) {
+  return translate(scope == WindowsRemoteSessionScope.physicalConsole
+      ? 'Remote changes are shown on the physical Windows monitor.'
+      : 'This is a separate Windows desktop. To control the physical monitor, disconnect RDP and reconnect to Console.');
+}
+
+void showWindowsSessionScopeInfo(BuildContext context, FFI ffi) {
+  final scope = windowsRemoteSessionScope(ffi);
+  if (scope == WindowsRemoteSessionScope.unknown) return;
+  msgBox(
+    ffi.sessionId,
+    'custom-nook-nocancel-hasclose-info',
+    'Windows session',
+    scope == WindowsRemoteSessionScope.physicalConsole
+        ? 'Remote changes are shown on the physical Windows monitor.'
+        : 'This is a separate Windows desktop. To control the physical monitor, disconnect RDP and reconnect to Console.',
+    '',
+    ffi.dialogManager,
+  );
+}
+
+/// A small, always-visible explanation of whether this Windows connection is
+/// changing the physical monitor or a separate remote desktop.
+Widget windowsSessionScopeIndicator(
+  BuildContext context,
+  FFI ffi, {
+  bool iconOnly = false,
+}) {
+  final scope = windowsRemoteSessionScope(ffi);
+  if (scope == WindowsRemoteSessionScope.unknown) {
+    return const SizedBox.shrink();
+  }
+  final isPhysical = scope == WindowsRemoteSessionScope.physicalConsole;
+  final color = isPhysical ? const Color(0xFF237A3B) : const Color(0xFF9A5A00);
+  final label = _windowsSessionScopeLabel(scope);
+  return Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 3),
+    child: Tooltip(
+      message: _windowsSessionScopeMessage(scope),
+      child: Semantics(
+        button: true,
+        label: label,
+        child: Material(
+          color: color,
+          borderRadius: BorderRadius.circular(5),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(5),
+            onTap: () => showWindowsSessionScopeInfo(context, ffi),
+            child: Padding(
+              padding: EdgeInsets.symmetric(
+                horizontal: iconOnly ? 7 : 8,
+                vertical: 6,
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    isPhysical
+                        ? Icons.desktop_windows_outlined
+                        : Icons.layers_outlined,
+                    size: 16,
+                    color: Colors.white,
+                  ),
+                  if (!iconOnly) ...[
+                    const SizedBox(width: 5),
+                    Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
 
 Future<bool> openWaylandKeyboardIssueUrl() {
   return launchUrl(
@@ -338,6 +442,28 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
   final isWaylandPeer = pi.platform == kPeerPlatformLinux && pi.isWayland;
 
   List<TTextMenu> v = [];
+  if (isDefaultConn && pi.platform == kPeerPlatformWindows) {
+    final scope = windowsRemoteSessionScope(ffi);
+    if (scope != WindowsRemoteSessionScope.unknown) {
+      final isPhysical = scope == WindowsRemoteSessionScope.physicalConsole;
+      v.add(TTextMenu(
+        child: Text(translate(isPhysical
+            ? 'Windows session: physical monitor'
+            : 'Windows session: separate desktop')),
+        onPressed: () => showWindowsSessionScopeInfo(context, ffi),
+      ));
+    }
+    v.add(TTextMenu(
+      child: Text(translate('Choose Windows desktop')),
+      onPressed: () {
+        bind.mainSetPeerFlutterOptionSync(
+            id: id, k: kSelectedWindowsSessionOption, v: '');
+        bind.mainSetPeerFlutterOptionSync(
+            id: id, k: kSelectedWindowsSessionKindOption, v: '');
+        ffiModel.reconnect(ffi.dialogManager, sessionId, false);
+      },
+    ));
+  }
   // elevation
   if (isDefaultConn &&
       perms['keyboard'] != false &&
@@ -379,6 +505,31 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
     );
   }
   // paste
+  if (isIOS &&
+      isDefaultConn &&
+      ffiModel.keyboard &&
+      !ffiModel.viewOnly &&
+      perms['clipboard'] != false) {
+    v.add(TTextMenu(
+      child: Text(translate('Send clipboard to remote')),
+      onPressed: () async {
+        try {
+          final payload = await iosClipboardBridge.readLocal();
+          final error = bind.sessionSendIosClipboard(
+            sessionId: sessionId,
+            text: payload.text,
+            png: payload.png ?? Uint8List(0),
+          );
+          showToast(translate(error.isEmpty ? 'Clipboard sent' : error));
+        } on IosClipboardException catch (error) {
+          showToast(translate(error.message));
+        } catch (error) {
+          debugPrint('Failed to send iOS clipboard: $error');
+          showToast(translate('Failed'));
+        }
+      },
+    ));
+  }
   if (isDefaultConn &&
       pi.platform != kPeerPlatformAndroid &&
       perms['keyboard'] != false) {
@@ -464,12 +615,14 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
         connToken: connToken);
   }
 
-  if (isDefaultConn && isDesktop) {
+  if (isDefaultConn && (isDesktop || isMobile) && perms['file'] != false) {
     v.add(
       TTextMenu(
           child: Text(translate('Transfer file')),
           onPressed: () => connectWithToken(isFileTransfer: true)),
     );
+  }
+  if (isDefaultConn && isDesktop) {
     v.add(
       TTextMenu(
           child: Text(translate('View camera')),
@@ -501,7 +654,7 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
               // Web: login is required before connection, so no need to refresh
               // Mobile: same isolate, no need to send message
               if (isDesktop) {
-                rustDeskWinManager.call(
+                hdobbyDeskWinManager.call(
                     WindowType.Main, kWindowRefreshCurrentUser, "");
               }
             }
@@ -1031,6 +1184,33 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
     v.addAll(toolbarKeyboardToggles(ffi));
   }
 
+  if (isDefaultConn && isMobile && pi.supportsKeyboardGamepad) {
+    final ready = pi.keyboardGamepadReady;
+    v.add(TToggleMenu(
+        value: ffiModel.keyboardGamepad,
+        onChanged: ffiModel.keyboard && ready
+            ? (value) async {
+                if (value == null) return;
+                if (value &&
+                    bind.sessionIsKeyboardModeSupported(
+                        sessionId: sessionId, mode: kKeyMapMode)) {
+                  await bind.sessionSetKeyboardMode(
+                      sessionId: sessionId, value: kKeyMapMode);
+                }
+                await bind.sessionToggleOption(
+                    sessionId: sessionId, value: kOptionToggleKeyboardGamepad);
+                ffiModel.setKeyboardGamepad(bind.sessionGetToggleOptionSync(
+                    sessionId: sessionId, arg: kOptionToggleKeyboardGamepad));
+                ffiModel.setViewOnly(
+                    id,
+                    bind.sessionGetToggleOptionSync(
+                        sessionId: sessionId, arg: kOptionToggleViewOnly));
+              }
+            : null,
+        child: Text(translate(
+            ready ? 'Keyboard as gamepad' : 'keyboard-gamepad-driver-tip'))));
+  }
+
   // view mode (mobile only, desktop is in keyboard menu)
   if (isDefaultConn && isMobile && versionCmp(pi.version, '1.2.0') >= 0) {
     v.add(TToggleMenu(
@@ -1039,7 +1219,12 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
           if (value == null) return;
           await bind.sessionToggleOption(
               sessionId: ffi.sessionId, value: kOptionToggleViewOnly);
-          ffiModel.setViewOnly(id, value);
+          ffiModel.setViewOnly(
+              id,
+              bind.sessionGetToggleOptionSync(
+                  sessionId: sessionId, arg: kOptionToggleViewOnly));
+          ffiModel.setKeyboardGamepad(bind.sessionGetToggleOptionSync(
+              sessionId: sessionId, arg: kOptionToggleKeyboardGamepad));
         },
         child: Text(translate('View Mode'))));
   }
@@ -1191,8 +1376,13 @@ List<TToggleMenu> toolbarKeyboardToggles(FFI ffi) {
       ffi.inputModel.isRelativeMouseModeSupported) {
     v.add(TToggleMenu(
         value: ffi.inputModel.relativeMouseMode.value,
-        onChanged: (value) {
+        onChanged: (value) async {
           if (value == null) return;
+          if (value && ffiModel.collaborativeCursor) {
+            await bind.sessionToggleOption(
+                sessionId: sessionId, value: kOptionToggleCollaborativeCursor);
+            ffiModel.setCollaborativeCursor(false);
+          }
           final previousValue = ffi.inputModel.relativeMouseMode.value;
           final success = ffi.inputModel.setRelativeMouseMode(value);
           if (!success) {
@@ -1249,7 +1439,7 @@ bool showVirtualDisplayMenu(FFI ffi) {
   if (!ffi.ffiModel.pi.isInstalled) {
     return false;
   }
-  if (ffi.ffiModel.pi.isRustDeskIdd || ffi.ffiModel.pi.isAmyuniIdd) {
+  if (ffi.ffiModel.pi.isBundledIdd || ffi.ffiModel.pi.isAmyuniIdd) {
     return true;
   }
   return false;
@@ -1262,8 +1452,8 @@ List<Widget> getVirtualDisplayMenuChildren(
   }
   final pi = ffi.ffiModel.pi;
   final privacyModeState = PrivacyModeState.find(id);
-  if (pi.isRustDeskIdd) {
-    final virtualDisplays = ffi.ffiModel.pi.RustDeskVirtualDisplays;
+  if (pi.isBundledIdd) {
+    final virtualDisplays = ffi.ffiModel.pi.BundledVirtualDisplays;
     final children = <Widget>[];
     for (var i = 0; i < kMaxVirtualDisplayCount; i++) {
       children.add(Obx(() => CkbMenuButton(

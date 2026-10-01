@@ -69,7 +69,7 @@ pub struct Remote<T: InvokeUiSession> {
     read_jobs: Vec<fs::TransferJob>,
     write_jobs: Vec<fs::TransferJob>,
     remove_jobs: HashMap<i32, RemoveJob>,
-    timer: crate::RustDeskInterval,
+    timer: crate::AppInterval,
     last_update_jobs_status: (Instant, HashMap<i32, u64>),
     is_connected: bool,
     first_frame: bool,
@@ -98,7 +98,7 @@ impl ParsedPeerInfo {
     fn is_support_virtual_display(&self) -> bool {
         self.is_installed
             && self.platform == "Windows"
-            && (self.idd_impl == "rustdesk_idd" || self.idd_impl == "amyuni_idd")
+            && (self.idd_impl == "hdobbydesk_idd" || self.idd_impl == "amyuni_idd")
     }
 }
 
@@ -116,7 +116,7 @@ impl<T: InvokeUiSession> Remote<T> {
             read_jobs: Vec::new(),
             write_jobs: Vec::new(),
             remove_jobs: Default::default(),
-            timer: crate::rustdesk_interval(time::interval(SEC30)),
+            timer: crate::app_interval(time::interval(SEC30)),
             last_update_jobs_status: (Instant::now(), Default::default()),
             is_connected: false,
             first_frame: false,
@@ -231,7 +231,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 let mut rx_clip_client = rx_clip_client_holder.0.lock().await;
 
                 let mut status_timer =
-                    crate::rustdesk_interval(time::interval(Duration::new(1, 0)));
+                    crate::app_interval(time::interval(Duration::new(1, 0)));
                 let mut fps_instant = Instant::now();
 
                 let _keep_it = client::hc_connection(feedback, rendezvous_server, token).await;
@@ -292,7 +292,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 }
                                 self.update_jobs_status();
                             } else {
-                                self.timer = crate::rustdesk_interval(time::interval_at(Instant::now() + SEC30, SEC30));
+                                self.timer = crate::app_interval(time::interval_at(Instant::now() + SEC30, SEC30));
                             }
                         }
                         _ = status_timer.tick() => {
@@ -661,7 +661,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                             let total_size = job.total_size();
                             self.read_jobs.push(job);
-                            self.timer = crate::rustdesk_interval(time::interval(MILLI1));
+                            self.timer = crate::app_interval(time::interval(MILLI1));
                             allow_err!(
                                 peer.send(&fs::new_receive(id, to, file_num, files, total_size))
                                     .await
@@ -722,7 +722,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             );
                             job.is_last_job = true;
                             self.read_jobs.push(job);
-                            self.timer = crate::rustdesk_interval(time::interval(MILLI1));
+                            self.timer = crate::app_interval(time::interval(MILLI1));
                         }
                     }
                 }
@@ -1106,56 +1106,6 @@ impl<T: InvokeUiSession> Remote<T> {
         true
     }
 
-    async fn send_toggle_virtual_display_msg(&self, peer: &mut Stream) {
-        if self.handler.is_view_camera() {
-            return;
-        }
-        if !self.peer_info.is_support_virtual_display() {
-            return;
-        }
-        let lc = self.handler.lc.read().unwrap();
-        let displays = lc.get_option("virtual-display");
-        for d in displays.split(',') {
-            if let Ok(index) = d.parse::<i32>() {
-                let mut misc = Misc::new();
-                misc.set_toggle_virtual_display(ToggleVirtualDisplay {
-                    display: index,
-                    on: true,
-                    ..Default::default()
-                });
-                let mut msg_out = Message::new();
-                msg_out.set_misc(misc);
-                allow_err!(peer.send(&msg_out).await);
-            }
-        }
-    }
-
-    async fn send_toggle_privacy_mode_msg(&self, peer: &mut Stream) {
-        if self.handler.is_view_camera() {
-            return;
-        }
-        let lc = self.handler.lc.read().unwrap();
-        if lc.version >= hbb_common::get_version_number("1.2.4")
-            && lc.get_toggle_option("privacy-mode")
-        {
-            let impl_key = lc.get_option("privacy-mode-impl-key");
-            if impl_key == crate::privacy_mode::PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY
-                && !self.peer_info.is_support_virtual_display()
-            {
-                return;
-            }
-            let mut misc = Misc::new();
-            misc.set_toggle_privacy_mode(TogglePrivacyMode {
-                impl_key,
-                on: true,
-                ..Default::default()
-            });
-            let mut msg_out = Message::new();
-            msg_out.set_misc(misc);
-            allow_err!(peer.send(&msg_out).await);
-        }
-    }
-
     fn contains_key_frame(vf: &VideoFrame) -> bool {
         use video_frame::Union::*;
         match &vf.union {
@@ -1290,7 +1240,7 @@ impl<T: InvokeUiSession> Remote<T> {
             self.handler.msgbox(
                 "error",
                 "Download new version",
-                "upgrade_remote_rustdesk_client_to_{1.3.9}_tip",
+                "upgrade_remote_hdobbydesk_client_to_{1.3.9}_tip",
                 "",
             );
         } else {
@@ -1325,8 +1275,20 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.first_frame = true;
                         self.handler.close_success();
                         self.handler.adapt_size();
-                        self.send_toggle_virtual_display_msg(peer).await;
-                        self.send_toggle_privacy_mode_msg(peer).await;
+                        // A new connection must preserve the host's physical desktop.
+                        // Display privacy and virtual monitors require an explicit action
+                        // in this session; never replay them from a previous session.
+                        if !self.handler.is_view_camera() {
+                            let mut config = self.handler.load_config();
+                            if config.privacy_mode.v
+                                || config.options.contains_key("virtual-display")
+                            {
+                                config.privacy_mode.v = false;
+                                config.options.remove("virtual-display");
+                                self.handler.save_config(config);
+                                self.handler.update_privacy_mode();
+                            }
+                        }
                     }
                     self.video_format = CodecFormat::from(&vf);
 
@@ -1470,14 +1432,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         update_clipboard(vec![cb], ClipboardSide::Client);
                         #[cfg(target_os = "ios")]
                         {
-                            let content = if cb.compress {
-                                hbb_common::compress::decompress(&cb.content)
-                            } else {
-                                cb.content.into()
-                            };
-                            if let Ok(content) = String::from_utf8(content) {
-                                self.handler.clipboard(content);
-                            }
+                            self.handler.clipboard(vec![cb]);
                         }
                         #[cfg(target_os = "android")]
                         crate::clipboard::handle_msg_clipboard(cb);
@@ -1493,20 +1448,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         update_clipboard(_mcb.clipboards, ClipboardSide::Client);
                         #[cfg(target_os = "ios")]
                         {
-                            if let Some(cb) = _mcb
-                                .clipboards
-                                .iter()
-                                .find(|c| c.format.enum_value() == Ok(ClipboardFormat::Text))
-                            {
-                                let content = if cb.compress {
-                                    hbb_common::compress::decompress(&cb.content)
-                                } else {
-                                    cb.content.to_vec()
-                                };
-                                if let Ok(content) = String::from_utf8(content) {
-                                    self.handler.clipboard(content);
-                                }
-                            }
+                            self.handler.clipboard(_mcb.clipboards);
                         }
                         #[cfg(target_os = "android")]
                         crate::clipboard::handle_msg_multi_clipboards(_mcb);

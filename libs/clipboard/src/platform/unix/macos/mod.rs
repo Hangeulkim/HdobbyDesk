@@ -1,4 +1,5 @@
 mod item_data_provider;
+mod paste_destination;
 mod paste_observer;
 mod paste_task;
 pub mod pasteboard_context;

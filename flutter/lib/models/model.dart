@@ -39,8 +39,16 @@ import 'package:uuid/uuid.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:vector_math/vector_math.dart' show Vector2;
+import 'package:hdobby_input/hdobby_input.dart'
+    show
+        directConnectionErrorMessage,
+        directConnectionCanRetry,
+        shouldAutoRetryDirectConnection,
+        shouldRetryDirectConnectionSilently,
+        SessionReconnectBackoff;
 
 import '../common.dart';
+import '../hdobby/ios_clipboard.dart';
 import '../utils/image.dart' as img;
 import '../common/widgets/dialog.dart';
 import 'input_model.dart';
@@ -125,10 +133,12 @@ class FfiModel with ChangeNotifier {
   late VirtualMouseMode virtualMouseMode;
   Timer? _timer;
   Timer? _restartReconnectDelayTimer;
-  var _reconnects = 1;
+  final _reconnectBackoff = SessionReconnectBackoff();
   DateTime? _offlineReconnectStartTime;
   bool _viewOnly = false;
   bool _showMyCursor = false;
+  bool _collaborativeCursor = false;
+  bool _keyboardGamepad = false;
   WeakReference<FFI> parent;
   late final SessionID sessionId;
 
@@ -170,6 +180,8 @@ class FfiModel with ChangeNotifier {
 
   bool get viewOnly => _viewOnly;
   bool get showMyCursor => _showMyCursor;
+  bool get collaborativeCursor => _collaborativeCursor;
+  bool get keyboardGamepad => _keyboardGamepad;
 
   set inputBlocked(v) {
     _inputBlocked = v;
@@ -256,8 +268,13 @@ class FfiModel with ChangeNotifier {
     _secure = null;
     _direct = null;
     _inputBlocked = false;
+    _viewOnly = false;
+    _showMyCursor = false;
+    _collaborativeCursor = false;
+    _keyboardGamepad = false;
     _timer?.cancel();
     _timer = null;
+    _reconnectBackoff.reset();
     resetRestartReconnectState();
     clearPermissions();
     waitForImageTimer?.cancel();
@@ -362,6 +379,22 @@ class FfiModel with ChangeNotifier {
         handleCursorId(evt);
       } else if (name == 'cursor_position') {
         await parent.target?.cursorModel.updateCursorPosition(evt, peerId);
+      } else if (name == 'ios_clipboard' && isIOS) {
+        final token = evt['token'] as String? ?? '';
+        if (token.isEmpty) return;
+        try {
+          final text = evt['has_text'] == 'true'
+              ? bind.sessionGetIosClipboardText(token: token)
+              : '';
+          final png = evt['has_png'] == 'true'
+              ? bind.sessionGetIosClipboardPng(token: token)
+              : null;
+          await iosClipboardBridge.writeRemote(text: text, png: png);
+        } catch (error) {
+          debugPrint('Failed to apply incoming iOS clipboard: $error');
+        } finally {
+          await bind.sessionClearIosClipboard(token: token);
+        }
       } else if (name == 'clipboard') {
         Clipboard.setData(ClipboardData(text: evt['content']));
       } else if (name == 'permission') {
@@ -763,7 +796,7 @@ class FfiModel with ChangeNotifier {
       case kUrlActionClose:
         debugPrint("closing all instances");
         Future.microtask(() async {
-          await rustDeskWinManager.closeAllSubWindows();
+          await hdobbyDeskWinManager.closeAllSubWindows();
           windowManager.close();
         });
         break;
@@ -887,7 +920,7 @@ class FfiModel with ChangeNotifier {
     if (parent.target == null) return;
     final dialogManager = parent.target!.dialogManager;
     final sessions = evt['windows_sessions'];
-    final title = translate('Multiple Windows sessions found');
+    final title = translate('Choose Windows desktop');
     final text = translate('Please select the session you want to connect to');
     final type = "";
 
@@ -915,22 +948,25 @@ class FfiModel with ChangeNotifier {
     }
 
     if (type == 're-input-password') {
-      wrongPasswordDialog(sessionId, dialogManager, type, title, text);
+      wrongPasswordDialog(sessionId, dialogManager, type, title, text,
+          peerId: peerId);
     } else if (type == 'input-2fa') {
       enter2FaDialog(sessionId, dialogManager);
     } else if (type == 'input-password') {
-      enterPasswordDialog(sessionId, dialogManager);
+      enterPasswordDialog(sessionId, dialogManager, peerId: peerId);
     } else if (type == 'session-login' || type == 'session-re-login') {
       enterUserLoginDialog(sessionId, dialogManager, 'login_linux_tip', true);
     } else if (type == 'session-login-password') {
       enterUserLoginAndPasswordDialog(
-          sessionId, dialogManager, 'login_linux_tip', true);
+          sessionId, dialogManager, 'login_linux_tip', true,
+          peerId: peerId);
     } else if (type == 'terminal-admin-login') {
       enterUserLoginDialog(
           sessionId, dialogManager, 'terminal-admin-login-tip', false);
     } else if (type == 'terminal-admin-login-password') {
       enterUserLoginAndPasswordDialog(
-          sessionId, dialogManager, 'terminal-admin-login-tip', false);
+          sessionId, dialogManager, 'terminal-admin-login-tip', false,
+          peerId: peerId);
     } else if (type == 'restarting') {
       // Treat restart messages as reconnect control events. Rust still sends
       // title/text for legacy UI and translation reuse; Flutter keeps the last
@@ -964,7 +1000,15 @@ class FfiModel with ChangeNotifier {
     } else if (type == 'elevation-error') {
       showElevationError(sessionId, type, title, text, dialogManager);
     } else if (type == 'relay-hint' || type == 'relay-hint2') {
-      showRelayHintDialog(sessionId, type, title, text, dialogManager, peerId);
+      // No public rendezvous/relay fallback exists in direct-only mode. A
+      // transport reset keeps the pinned certificate and can be retried locally.
+      if (parent.target?.serverModel.directOnly ?? true) {
+        showMsgBox(sessionId, type, title, text, link,
+            directConnectionCanRetry(text), dialogManager);
+      } else {
+        showRelayHintDialog(
+            sessionId, type, title, text, dialogManager, peerId);
+      }
     } else if (text == kMsgboxTextWaitingForImage) {
       showConnectedWaitingForImage(dialogManager, sessionId, type, title, text);
     } else if (title == 'Privacy mode') {
@@ -1052,17 +1096,36 @@ class FfiModel with ChangeNotifier {
   showMsgBox(SessionID sessionId, String type, String title, String text,
       String link, bool hasRetry, OverlayDialogManager dialogManager,
       {bool? hasCancel}) async {
+    final rawError = text;
+    final manualDirectRetry = directConnectionCanRetry(text);
+    final retryable = (hasRetry || manualDirectRetry) &&
+        (!(parent.target?.serverModel.directOnly ?? true) ||
+            !manualDirectRetry ||
+            shouldAutoRetryDirectConnection(rawError,
+                authenticated: _pi.isSet.isTrue,
+                attempts: _reconnectBackoff.attempts));
+    if (text.startsWith('Direct TLS ') ||
+        text.startsWith(
+            'peer closed connection without sending TLS close_notify') ||
+        text == 'Direct TCP connection timed out') {
+      final configured =
+          isWeb ? '' : bind.mainGetLocalOption(key: kCommConfKeyLang);
+      final language = configured.isEmpty
+          ? ui.PlatformDispatcher.instance.locale.languageCode
+          : configured;
+      text = directConnectionErrorMessage(text, languageCode: language) ?? text;
+    }
     final noteAllowed = parent.target != null &&
         allowAskForNoteAtEndOfConnection(parent.target, false) &&
         (title == "Connection Error" || type == "restarting");
-    final showNoteEdit = noteAllowed && !hasRetry;
+    final showNoteEdit = noteAllowed && !retryable;
     if (showNoteEdit) {
       await showConnEndAuditDialogCloseCanceled(
           ffi: parent.target!, type: type, title: title, text: text);
       closeConnection();
     } else {
       VoidCallback? onSubmit;
-      if (noteAllowed && hasRetry) {
+      if (noteAllowed && retryable) {
         final ffi = parent.target!;
         onSubmit = () async {
           _timer?.cancel();
@@ -1072,20 +1135,34 @@ class FfiModel with ChangeNotifier {
           closeConnection();
         };
       }
-      msgBox(sessionId, type, title, text, link, dialogManager,
-          hasCancel: hasCancel,
-          reconnect: hasRetry ? reconnect : null,
-          reconnectTimeout: hasRetry ? _reconnects : null,
-          onSubmit: onSubmit);
+      final retryDelay =
+          retryable ? _reconnectBackoff.nextDelay(DateTime.now()) : null;
+      if (retryDelay != null &&
+          shouldRetryDirectConnectionSilently(rawError,
+              authenticated: _pi.isSet.isTrue,
+              attempt: _reconnectBackoff.attempts)) {
+        // A fresh listener or Console/RDP handoff can briefly close the socket.
+        // Retry exact transport failures without flashing an error dialog.
+        dialogManager.dismissAll();
+        dialogManager.showLoading(translate('Connecting...'),
+            onCancel: closeConnection);
+      } else {
+        msgBox(sessionId, type, title, text, link, dialogManager,
+            hasCancel: hasCancel,
+            reconnect: retryable ? reconnect : null,
+            reconnectTimeout: retryDelay?.inSeconds,
+            onSubmit: onSubmit);
+      }
+      _timer?.cancel();
+      _timer = null;
+      if (retryDelay != null) {
+        _timer = Timer(retryDelay, () {
+          reconnect(dialogManager, sessionId, false);
+        });
+      }
     }
-    _timer?.cancel();
-    if (hasRetry) {
-      _timer = Timer(Duration(seconds: _reconnects), () {
-        reconnect(dialogManager, sessionId, false);
-      });
-      _reconnects *= 2;
-    } else {
-      _reconnects = 1;
+    if (!retryable) {
+      _reconnectBackoff.reset();
       _offlineReconnectStartTime = null;
     }
   }
@@ -1103,6 +1180,8 @@ class FfiModel with ChangeNotifier {
 
   void reconnect(OverlayDialogManager dialogManager, SessionID sessionId,
       bool forceRelay) {
+    _timer?.cancel();
+    _timer = null;
     // Disable relative mouse mode before reconnecting to ensure cursor is released.
     parent.target?.inputModel.setRelativeMouseMode(false);
     _cancelPendingMonitorRestore();
@@ -1111,6 +1190,14 @@ class FfiModel with ChangeNotifier {
     dialogManager.dismissAll();
     dialogManager.showLoading(translate('Connecting...'),
         onCancel: closeConnection);
+  }
+
+  /// Run a suspended retry immediately when Android/iOS returns to foreground.
+  bool resumePendingReconnect(
+      OverlayDialogManager dialogManager, SessionID sessionId) {
+    if (_timer?.isActive != true || parent.target?.closed == true) return false;
+    reconnect(dialogManager, sessionId, false);
+    return true;
   }
 
   Future<void> showRelayHintDialog(
@@ -1389,6 +1476,13 @@ class FfiModel with ChangeNotifier {
       final optLocal = bind.mainGetLocalOption(key: kOptionTouchMode);
       if (optLocal != '') {
         _touchMode = optLocal == 'Y';
+      } else if (isMobile) {
+        // A phone tap should target the visible point even when somebody moves
+        // the host's physical mouse between frames. Trackpad mode intentionally
+        // shares the host cursor and therefore cannot provide that guarantee.
+        // Keep it available as an explicit user choice, but make direct touch
+        // the safe default for new mobile installations.
+        _touchMode = true;
       } else {
         final optSession = await bind.sessionGetOption(
             sessionId: sessionId, arg: kOptionTouchMode);
@@ -1439,7 +1533,7 @@ class FfiModel with ChangeNotifier {
             () => parent.target?._applyPendingMonitorRestore());
       }
       if (displays.isNotEmpty) {
-        _reconnects = 1;
+        _reconnectBackoff.reset();
         _offlineReconnectStartTime = null;
         resetRestartReconnectState();
         waitForFirstImage.value = true;
@@ -1459,6 +1553,10 @@ class FfiModel with ChangeNotifier {
               sessionId: sessionId, arg: kOptionToggleViewOnly));
       setShowMyCursor(bind.sessionGetToggleOptionSync(
           sessionId: sessionId, arg: kOptionToggleShowMyCursor));
+      setCollaborativeCursor(bind.sessionGetToggleOptionSync(
+          sessionId: sessionId, arg: kOptionToggleCollaborativeCursor));
+      setKeyboardGamepad(bind.sessionGetToggleOptionSync(
+          sessionId: sessionId, arg: kOptionToggleKeyboardGamepad));
     }
     if (connType == ConnType.defaultConn || connType == ConnType.viewCamera) {
       final platformAdditions = evt['platform_additions'];
@@ -1469,6 +1567,22 @@ class FfiModel with ChangeNotifier {
           debugPrint('Failed to decode platformAdditions $e');
         }
       }
+    }
+    if (connType == ConnType.defaultConn &&
+        _collaborativeCursor &&
+        !_pi.supportsCollaborativeCursor) {
+      // A downgraded or upstream peer would otherwise ignore the new option
+      // and treat hover packets as normal mouse movement.
+      await bind.sessionToggleOption(
+          sessionId: sessionId, value: kOptionToggleCollaborativeCursor);
+      setCollaborativeCursor(false);
+    }
+    if (connType == ConnType.defaultConn &&
+        _keyboardGamepad &&
+        (!_pi.supportsKeyboardGamepad || !_pi.keyboardGamepadReady)) {
+      await bind.sessionToggleOption(
+          sessionId: sessionId, value: kOptionToggleKeyboardGamepad);
+      setKeyboardGamepad(false);
     }
 
     _pi.isSet.value = true;
@@ -1712,7 +1826,7 @@ class FfiModel with ChangeNotifier {
     }
 
     if (updateData.isEmpty) {
-      _pi.platformAdditions.remove(kPlatformAdditionsRustDeskVirtualDisplays);
+      _pi.platformAdditions.remove(kPlatformAdditionsBundledVirtualDisplays);
       _pi.platformAdditions.remove(kPlatformAdditionsAmyuniVirtualDisplays);
     } else {
       try {
@@ -1720,10 +1834,9 @@ class FfiModel with ChangeNotifier {
         for (final key in updateJson.keys) {
           _pi.platformAdditions[key] = updateJson[key];
         }
-        if (!updateJson
-            .containsKey(kPlatformAdditionsRustDeskVirtualDisplays)) {
+        if (!updateJson.containsKey(kPlatformAdditionsBundledVirtualDisplays)) {
           _pi.platformAdditions
-              .remove(kPlatformAdditionsRustDeskVirtualDisplays);
+              .remove(kPlatformAdditionsBundledVirtualDisplays);
         }
         if (!updateJson.containsKey(kPlatformAdditionsAmyuniVirtualDisplays)) {
           _pi.platformAdditions.remove(kPlatformAdditionsAmyuniVirtualDisplays);
@@ -1826,6 +1939,20 @@ class FfiModel with ChangeNotifier {
   void setShowMyCursor(bool value) {
     if (_showMyCursor != value) {
       _showMyCursor = value;
+      notifyListeners();
+    }
+  }
+
+  void setCollaborativeCursor(bool value) {
+    if (_collaborativeCursor != value) {
+      _collaborativeCursor = value;
+      notifyListeners();
+    }
+  }
+
+  void setKeyboardGamepad(bool value) {
+    if (_keyboardGamepad != value) {
+      _keyboardGamepad = value;
       notifyListeners();
     }
   }
@@ -2620,7 +2747,7 @@ class CanvasModel with ChangeNotifier {
       bumpAmount.y += bumpAmount.y.sign * 0.5;
 
       var bumpMouseSucceeded = _bumpMouseIsWorking &&
-          (await rustDeskWinManager.call(WindowType.Main, kWindowBumpMouse,
+          (await hdobbyDeskWinManager.call(WindowType.Main, kWindowBumpMouse,
                   {"dx": bumpAmount.x.round(), "dy": bumpAmount.y.round()}))
               .result;
 
@@ -2966,6 +3093,7 @@ class PredefinedCursor {
 class CursorModel with ChangeNotifier {
   ui.Image? _image;
   final _images = <String, Tuple3<ui.Image, double, double>>{};
+  final _textCursorIds = <String>{};
   CursorData? _cache;
   final _cacheMap = <String, CursorData>{};
   final _cacheKeys = <String>{};
@@ -3052,6 +3180,7 @@ class CursorModel with ChangeNotifier {
   get lastIsBlocked => _lastIsBlocked;
 
   ui.Image? get image => _image;
+  bool get isTextInputCursor => _textCursorIds.contains(_id);
   CursorData? get cache => _cache;
 
   double get x => _x - _displayOriginX;
@@ -3376,10 +3505,16 @@ class CursorModel with ChangeNotifier {
   disposeImages() {
     _images.forEach((_, v) => v.item1.dispose());
     _images.clear();
+    _textCursorIds.clear();
   }
 
   updateCursorData(Map<String, dynamic> evt) async {
     final id = evt['id'];
+    if (evt['text_input_cursor'] == 'true') {
+      _textCursorIds.add(id);
+    } else {
+      _textCursorIds.remove(id);
+    }
     final hotx = double.parse(evt['hotx']);
     final hoty = double.parse(evt['hoty']);
     final width = int.parse(evt['width']);
@@ -4140,12 +4275,18 @@ class PeerInfo with ChangeNotifier {
   RxBool isSet = false.obs;
 
   bool get isWayland => platformAdditions[kPlatformAdditionsIsWayland] == true;
+  bool get supportsCollaborativeCursor =>
+      platformAdditions['collaborative_cursor'] == true;
+  bool get supportsKeyboardGamepad =>
+      platformAdditions['keyboard_gamepad'] == true;
+  bool get keyboardGamepadReady =>
+      platformAdditions['keyboard_gamepad_ready'] == true;
   bool get isHeadless => platformAdditions[kPlatformAdditionsHeadless] == true;
   bool get isInstalled =>
       platform != kPeerPlatformWindows ||
       platformAdditions[kPlatformAdditionsIsInstalled] == true;
-  List<int> get RustDeskVirtualDisplays => List<int>.from(
-      platformAdditions[kPlatformAdditionsRustDeskVirtualDisplays] ?? []);
+  List<int> get BundledVirtualDisplays => List<int>.from(
+      platformAdditions[kPlatformAdditionsBundledVirtualDisplays] ?? []);
   int get amyuniVirtualDisplayCount =>
       platformAdditions[kPlatformAdditionsAmyuniVirtualDisplays] ?? 0;
 
@@ -4155,8 +4296,8 @@ class PeerInfo with ChangeNotifier {
 
   bool get cursorEmbedded => tryGetDisplay()?.cursorEmbedded ?? false;
 
-  bool get isRustDeskIdd =>
-      platformAdditions[kPlatformAdditionsIddImpl] == 'rustdesk_idd';
+  bool get isBundledIdd =>
+      platformAdditions[kPlatformAdditionsIddImpl] == 'hdobbydesk_idd';
   bool get isAmyuniIdd =>
       platformAdditions[kPlatformAdditionsIddImpl] == 'amyuni_idd';
 

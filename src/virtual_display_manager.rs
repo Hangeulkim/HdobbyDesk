@@ -2,11 +2,11 @@ use hbb_common::{bail, platform::windows::is_windows_version_or_greater, ResultT
 
 // This string is defined here.
 //  https://github.com/rustdesk-org/RustDeskIddDriver/blob/b370aad3f50028b039aad211df60c8051c4a64d6/RustDeskIddDriver/RustDeskIddDriver.inf#LL73C1-L73C40
-pub const RUSTDESK_IDD_DEVICE_STRING: &'static str = "RustDeskIddDriver Device\0";
+pub const HDOBBYDESK_IDD_DEVICE_STRING: &'static str = "RustDeskIddDriver Device\0";
 pub const AMYUNI_IDD_DEVICE_STRING: &'static str = "USB Mobile Monitor Virtual Display\0";
 
 const IDD_IMPL: &str = IDD_IMPL_AMYUNI;
-const IDD_IMPL_RUSTDESK: &str = "rustdesk_idd";
+const IDD_IMPL_HDOBBYDESK: &str = "hdobbydesk_idd";
 const IDD_IMPL_AMYUNI: &str = "amyuni_idd";
 const IDD_PLUG_OUT_ALL_INDEX: i32 = -1;
 
@@ -16,7 +16,7 @@ pub fn is_amyuni_idd() -> bool {
 
 pub fn get_cur_device_string() -> &'static str {
     match IDD_IMPL {
-        IDD_IMPL_RUSTDESK => RUSTDESK_IDD_DEVICE_STRING,
+        IDD_IMPL_HDOBBYDESK => HDOBBYDESK_IDD_DEVICE_STRING,
         IDD_IMPL_AMYUNI => AMYUNI_IDD_DEVICE_STRING,
         _ => "",
     }
@@ -35,7 +35,7 @@ pub fn is_virtual_display_supported() -> bool {
 
 pub fn plug_in_headless() -> ResultType<()> {
     match IDD_IMPL {
-        IDD_IMPL_RUSTDESK => rustdesk_idd::plug_in_headless(),
+        IDD_IMPL_HDOBBYDESK => hdobbydesk_idd::plug_in_headless(),
         IDD_IMPL_AMYUNI => amyuni_idd::plug_in_headless(),
         _ => bail!("Unsupported virtual display implementation."),
     }
@@ -48,11 +48,11 @@ pub fn get_platform_additions() -> serde_json::Map<String, serde_json::Value> {
     }
     map.insert("idd_impl".into(), serde_json::json!(IDD_IMPL));
     match IDD_IMPL {
-        IDD_IMPL_RUSTDESK => {
-            let virtual_displays = rustdesk_idd::get_virtual_displays();
+        IDD_IMPL_HDOBBYDESK => {
+            let virtual_displays = hdobbydesk_idd::get_virtual_displays();
             if !virtual_displays.is_empty() {
                 map.insert(
-                    "rustdesk_virtual_displays".into(),
+                    "hdobbydesk_virtual_displays".into(),
                     serde_json::json!(virtual_displays),
                 );
             }
@@ -71,7 +71,7 @@ pub fn get_platform_additions() -> serde_json::Map<String, serde_json::Value> {
 #[inline]
 pub fn plug_in_monitor(idx: u32, modes: Vec<virtual_display::MonitorMode>) -> ResultType<()> {
     match IDD_IMPL {
-        IDD_IMPL_RUSTDESK => rustdesk_idd::plug_in_index_modes(idx, modes),
+        IDD_IMPL_HDOBBYDESK => hdobbydesk_idd::plug_in_index_modes(idx, modes),
         IDD_IMPL_AMYUNI => amyuni_idd::plug_in_monitor(),
         _ => bail!("Unsupported virtual display implementation."),
     }
@@ -79,13 +79,13 @@ pub fn plug_in_monitor(idx: u32, modes: Vec<virtual_display::MonitorMode>) -> Re
 
 pub fn plug_out_monitor(index: i32, force_all: bool, force_one: bool) -> ResultType<()> {
     match IDD_IMPL {
-        IDD_IMPL_RUSTDESK => {
+        IDD_IMPL_HDOBBYDESK => {
             let indices = if index == IDD_PLUG_OUT_ALL_INDEX {
-                rustdesk_idd::get_virtual_displays()
+                hdobbydesk_idd::get_virtual_displays()
             } else {
                 vec![index as _]
             };
-            rustdesk_idd::plug_out_peer_request(&indices)
+            hdobbydesk_idd::plug_out_peer_request(&indices)
         }
         IDD_IMPL_AMYUNI => amyuni_idd::plug_out_monitor(index, force_all, force_one),
         _ => bail!("Unsupported virtual display implementation."),
@@ -94,7 +94,7 @@ pub fn plug_out_monitor(index: i32, force_all: bool, force_one: bool) -> ResultT
 
 pub fn plug_in_peer_request(modes: Vec<Vec<virtual_display::MonitorMode>>) -> ResultType<Vec<u32>> {
     match IDD_IMPL {
-        IDD_IMPL_RUSTDESK => rustdesk_idd::plug_in_peer_request(modes),
+        IDD_IMPL_HDOBBYDESK => hdobbydesk_idd::plug_in_peer_request(modes),
         IDD_IMPL_AMYUNI => {
             amyuni_idd::plug_in_monitor()?;
             Ok(vec![0])
@@ -109,7 +109,7 @@ pub fn plug_out_monitor_indices(
     force_one: bool,
 ) -> ResultType<()> {
     match IDD_IMPL {
-        IDD_IMPL_RUSTDESK => rustdesk_idd::plug_out_peer_request(indices),
+        IDD_IMPL_HDOBBYDESK => hdobbydesk_idd::plug_out_peer_request(indices),
         IDD_IMPL_AMYUNI => {
             for _idx in indices.iter() {
                 amyuni_idd::plug_out_monitor(0, force_all, force_one)?;
@@ -122,13 +122,13 @@ pub fn plug_out_monitor_indices(
 
 pub fn reset_all() -> ResultType<()> {
     match IDD_IMPL {
-        IDD_IMPL_RUSTDESK => rustdesk_idd::reset_all(),
+        IDD_IMPL_HDOBBYDESK => hdobbydesk_idd::reset_all(),
         IDD_IMPL_AMYUNI => amyuni_idd::reset_all(),
         _ => bail!("Unsupported virtual display implementation."),
     }
 }
 
-pub mod rustdesk_idd {
+pub mod hdobbydesk_idd {
     use super::windows;
     use hbb_common::{allow_err, bail, lazy_static, log, ResultType};
     use std::{
@@ -194,7 +194,7 @@ pub mod rustdesk_idd {
 
     #[inline]
     fn get_device_names() -> Vec<String> {
-        windows::get_device_names(Some(super::RUSTDESK_IDD_DEVICE_STRING))
+        windows::get_device_names(Some(super::HDOBBYDESK_IDD_DEVICE_STRING))
     }
 
     pub fn plug_in_headless() -> ResultType<()> {

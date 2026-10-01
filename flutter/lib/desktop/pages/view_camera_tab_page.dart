@@ -107,7 +107,7 @@ class _ViewCameraTabPageState extends State<ViewCameraTabPage> {
       _update_remote_count();
     }
     tabController.onRemoved = (_, id) => onRemoveId(id);
-    rustDeskWinManager.setMethodHandler(_remoteMethodHandler);
+    hdobbyDeskWinManager.setMethodHandler(_remoteMethodHandler);
   }
 
   @override

@@ -14,7 +14,7 @@ use std::{
     collections::HashSet,
     fs::File,
     io::{BufRead, BufReader, Read, Seek},
-    os::unix::prelude::PermissionsExt,
+    os::unix::prelude::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::SystemTime,
@@ -43,11 +43,22 @@ pub(super) struct LocalFile {
 
 impl LocalFile {
     pub fn try_open(relative_root: &Path, path: &Path) -> Result<Self, CliprdrError> {
-        let mt = std::fs::metadata(path).map_err(|e| CliprdrError::FileError {
+        let relative =
+            path.strip_prefix(relative_root)
+                .map_err(|_| CliprdrError::InvalidRequest {
+                    description: "clipboard file is outside its selected folder".to_owned(),
+                })?;
+        validate_wire_path(relative)?;
+        let mt = std::fs::symlink_metadata(path).map_err(|e| CliprdrError::FileError {
             path: path.to_string_lossy().to_string(),
             err: e,
         })?;
-        let size = mt.len() as u64;
+        if !mt.is_file() && !mt.is_dir() {
+            return Err(CliprdrError::InvalidRequest {
+                description: "clipboard symlinks and special files are not supported".to_owned(),
+            });
+        }
+        let size = if mt.is_file() { mt.len() } else { 0 };
         let is_dir = mt.is_dir();
         let read_only = mt.permissions().readonly();
         let system = false;
@@ -85,7 +96,7 @@ impl LocalFile {
             normal,
         })
     }
-    pub fn as_bin(&self) -> Vec<u8> {
+    pub fn as_bin(&self) -> Result<Vec<u8>, CliprdrError> {
         let mut buf = BytesMut::with_capacity(592);
 
         let read_only_flag = if self.read_only { 0x1 } else { 0 };
@@ -106,21 +117,27 @@ impl LocalFile {
             .last_write_time
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos() as u64
-            / 100
-            + LDAP_EPOCH_DELTA;
+            .as_nanos()
+            / 100;
+        let win32_time =
+            u64::try_from(win32_time + u128::from(LDAP_EPOCH_DELTA)).map_err(|_| {
+                CliprdrError::InvalidRequest {
+                    description: "clipboard timestamp out of range".to_owned(),
+                }
+            })?;
 
         let size_high = (self.size >> 32) as u32;
         let size_low = (self.size & (u32::MAX as u64)) as u32;
 
-        let path = self
-            .path
-            .strip_prefix(&self.relative_root)
-            .unwrap_or(&self.path)
-            .to_string_lossy()
-            .into_owned();
+        let path = self.path.strip_prefix(&self.relative_root).map_err(|_| {
+            CliprdrError::InvalidRequest {
+                description: "clipboard file is outside its selected folder".to_owned(),
+            }
+        })?;
+        validate_wire_path(path)?;
+        let path = path.to_string_lossy();
 
-        let wstr: WString<utf16string::LE> = WString::from(&path);
+        let wstr: WString<utf16string::LE> = WString::from(path.as_ref());
         let name = wstr.as_bytes();
 
         log::trace!(
@@ -162,16 +179,29 @@ impl LocalFile {
         buf.put(name);
         buf.put(&vec![0u8; 520 - name_len][..]);
 
-        buf.to_vec()
+        Ok(buf.to_vec())
     }
 
     #[inline]
     pub fn load_handle(&mut self) -> Result<(), CliprdrError> {
         if !self.is_dir && self.handle.is_none() {
-            let handle = std::fs::File::open(&self.path).map_err(|e| CliprdrError::FileError {
+            let handle = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&self.path)
+                .map_err(|e| CliprdrError::FileError {
+                    path: self.path.to_string_lossy().to_string(),
+                    err: e,
+                })?;
+            let metadata = handle.metadata().map_err(|err| CliprdrError::FileError {
                 path: self.path.to_string_lossy().to_string(),
-                err: e,
+                err,
             })?;
+            if !metadata.is_file() {
+                return Err(CliprdrError::InvalidRequest {
+                    description: "clipboard source is no longer a regular file".to_owned(),
+                });
+            }
             let mut reader = BufReader::with_capacity(BLOCK_SIZE as usize * 2, handle);
             reader.fill_buf().map_err(|e| CliprdrError::FileError {
                 path: self.path.to_string_lossy().to_string(),
@@ -224,6 +254,18 @@ impl LocalFile {
     }
 }
 
+fn validate_wire_path(path: &Path) -> Result<(), CliprdrError> {
+    super::filetype::validate_relative_path(path).map_err(|_| CliprdrError::InvalidRequest {
+        description: "invalid clipboard file path".to_owned(),
+    })?;
+    if path.to_string_lossy().encode_utf16().count() > 259 {
+        return Err(CliprdrError::InvalidRequest {
+            description: "clipboard file path exceeds the protocol limit".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn construct_file_list(paths: &[PathBuf]) -> Result<Vec<LocalFile>, CliprdrError> {
     fn constr_file_lst(
         relative_root: &Path,
@@ -237,15 +279,15 @@ pub(super) fn construct_file_list(paths: &[PathBuf]) -> Result<Vec<LocalFile>, C
         }
         visited.insert(path.to_path_buf());
 
+        if file_list.len() >= 65_536 {
+            return Err(CliprdrError::InvalidRequest {
+                description: "too many clipboard files".to_owned(),
+            });
+        }
         let local_file = LocalFile::try_open(relative_root, path)?;
+        let is_dir = local_file.is_dir;
         file_list.push(local_file);
-
-        let mt = std::fs::metadata(path).map_err(|e| CliprdrError::FileError {
-            path: path.to_string_lossy().to_string(),
-            err: e,
-        })?;
-
-        if mt.is_dir() {
+        if is_dir {
             let dir = std::fs::read_dir(path).map_err(|e| CliprdrError::FileError {
                 path: path.to_string_lossy().to_string(),
                 err: e,
@@ -304,7 +346,7 @@ mod file_list_test {
         #[inline]
         fn generate_file(path: &str, name: &str, is_dir: bool) -> LocalFile {
             LocalFile {
-                relative_root: PathBuf::from("."),
+                relative_root: PathBuf::new(),
                 path: PathBuf::from(path),
                 handle: None,
                 name: name.to_string(),
@@ -352,7 +394,7 @@ mod file_list_test {
         let mut pdu = BytesMut::with_capacity(4 + 592 * tree.len());
         pdu.put_u32_le(tree.len() as u32);
         for file in tree {
-            pdu.put(file.as_bin().as_slice());
+            pdu.put(file.as_bin()?.as_slice());
         }
 
         let parsed = FileDescription::parse_file_descriptors(pdu.to_vec(), 0)?;
@@ -386,10 +428,52 @@ mod file_list_test {
 
     #[test]
     fn test_parse_file_descriptors() -> Result<(), CliprdrError> {
-        as_bin_parse_test("")?;
-        as_bin_parse_test("/")?;
+        assert!(as_bin_parse_test("").is_err());
+        assert!(as_bin_parse_test("/").is_err());
         as_bin_parse_test("test")?;
-        as_bin_parse_test("/test")?;
+        as_bin_parse_test("한글 폴더")?;
+        assert!(as_bin_parse_test("/test").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_symlink_and_overlong_source_names() -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("hdobby-source-test-{}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            std::fs::write(root.join("original"), b"private")?;
+            std::os::unix::fs::symlink(root.join("original"), root.join("link"))?;
+            assert!(LocalFile::try_open(&root, &root.join("link")).is_err());
+            let nested = root.join("a".repeat(200));
+            std::fs::create_dir(&nested)?;
+            let long_file = nested.join("b".repeat(60));
+            std::fs::write(&long_file, b"data")?;
+            assert!(LocalFile::try_open(&root, &long_file).is_err());
+            let directory = LocalFile::try_open(&root, &nested)?;
+            assert_eq!(directory.size, 0);
+            let mut regular = LocalFile::try_open(&root, &root.join("original"))?;
+            std::fs::remove_file(root.join("original"))?;
+            std::os::unix::fs::symlink(root.join("missing"), root.join("original"))?;
+            assert!(regular.load_handle().is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(root)?;
+        result
+    }
+
+    #[test]
+    fn filetime_round_trip_uses_windows_epoch_without_nanosecond_overflow(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = generate_tree("folder").remove(1);
+        let seconds = 20_000_000_000;
+        file.last_write_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        let record = file.as_bin()?;
+        let ticks = u64::from_le_bytes(record[56..64].try_into()?);
+        assert_eq!(ticks, 116_444_736_000_000_000 + seconds * 10_000_000);
+        let mut pdu = 1u32.to_le_bytes().to_vec();
+        pdu.extend(record);
+        let decoded = FileDescription::parse_file_descriptors(pdu, 0)?;
+        assert_eq!(decoded[0].last_modified, file.last_write_time);
         Ok(())
     }
 

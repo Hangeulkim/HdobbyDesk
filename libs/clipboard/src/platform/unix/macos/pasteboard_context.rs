@@ -338,7 +338,7 @@ impl PasteboardContext {
         let target_dir = target_dir.to_owned();
         match FileDescription::parse_file_descriptors(format_data, conn_id) {
             Ok(files) => {
-                task_lock.start(target_dir, files);
+                task_lock.start(target_dir, files)?;
                 Ok(())
             }
             Err(e) => {

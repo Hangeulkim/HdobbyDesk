@@ -125,6 +125,10 @@ fn make_tray() -> hbb_common::ResultType<()> {
     });
     #[cfg(windows)]
     let mut last_click = std::time::Instant::now();
+    #[cfg(windows)]
+    let mut controlled_session_count = 0;
+    #[cfg(not(windows))]
+    let controlled_session_count = 0;
     #[cfg(target_os = "macos")]
     {
         use tao::platform::macos::EventLoopExtMacOS;
@@ -177,44 +181,50 @@ fn make_tray() -> hbb_common::ResultType<()> {
         }
 
         if let Ok(event) = menu_channel.try_recv() {
-            if let Some(quit_i) = &quit_i {
-                if event.id == quit_i.id() {
-                    /* failed in windows, seems no permission to check system process
-                    if !crate::check_process("--server", false) {
-                        *control_flow = ControlFlow::Exit;
-                        return;
-                    }
-                    */
-                    if !crate::platform::uninstall_service(false, false) {
-                        *control_flow = ControlFlow::Exit;
+            // A remote viewer shares this Windows desktop and could click the
+            // tray menu even when the management window is excluded.
+            if controlled_session_count == 0 {
+                if let Some(quit_i) = &quit_i {
+                    if event.id == quit_i.id() {
+                        /* failed in windows, seems no permission to check system process
+                        if !crate::check_process("--server", false) {
+                            *control_flow = ControlFlow::Exit;
+                            return;
+                        }
+                        */
+                        if !crate::platform::uninstall_service(false, false) {
+                            *control_flow = ControlFlow::Exit;
+                        }
+                    } else if event.id == open_i.id() {
+                        open_func();
                     }
                 } else if event.id == open_i.id() {
                     open_func();
                 }
-            } else if event.id == open_i.id() {
-                open_func();
             }
         }
 
         if let Ok(_event) = tray_channel.try_recv() {
             #[cfg(target_os = "windows")]
-            match _event {
-                TrayEvent::Click {
-                    button,
-                    button_state,
-                    ..
-                } => {
-                    if button == tray_icon::MouseButton::Left
-                        && button_state == tray_icon::MouseButtonState::Up
-                    {
-                        if last_click.elapsed() < std::time::Duration::from_secs(1) {
-                            return;
+            if controlled_session_count == 0 {
+                match _event {
+                    TrayEvent::Click {
+                        button,
+                        button_state,
+                        ..
+                    } => {
+                        if button == tray_icon::MouseButton::Left
+                            && button_state == tray_icon::MouseButtonState::Up
+                        {
+                            if last_click.elapsed() < std::time::Duration::from_secs(1) {
+                                return;
+                            }
+                            open_func();
+                            last_click = std::time::Instant::now();
                         }
-                        open_func();
-                        last_click = std::time::Instant::now();
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -222,11 +232,15 @@ fn make_tray() -> hbb_common::ResultType<()> {
         if let Ok(data) = ipc_receiver.try_recv() {
             match data {
                 Data::ControlledSessionCount(count) => {
-                    _tray_icon
-                        .lock()
-                        .unwrap()
-                        .as_mut()
-                        .map(|t| t.set_tooltip(Some(tooltip(count))));
+                    controlled_session_count = count;
+                    if let Some(tray) = _tray_icon.lock().unwrap().as_mut() {
+                        if let Err(error) = tray.set_visible(count == 0) {
+                            log::warn!("Could not update management tray visibility: {error}");
+                        }
+                        if count == 0 {
+                            let _ = tray.set_tooltip(Some(tooltip(count)));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -240,7 +254,7 @@ async fn start_query_session_count(sender: std::sync::mpsc::Sender<Data>) {
     let mut last_count = 0;
     loop {
         if let Ok(mut c) = crate::ipc::connect(1000, "").await {
-            let mut timer = crate::rustdesk_interval(tokio::time::interval(Duration::from_secs(1)));
+            let mut timer = crate::app_interval(tokio::time::interval(Duration::from_secs(1)));
             loop {
                 tokio::select! {
                     res = c.next() => {
@@ -265,6 +279,10 @@ async fn start_query_session_count(sender: std::sync::mpsc::Sender<Data>) {
                     }
                 }
             }
+        }
+        if last_count != 0 {
+            last_count = 0;
+            sender.send(Data::ControlledSessionCount(0)).ok();
         }
         hbb_common::sleep(1.).await;
     }

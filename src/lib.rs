@@ -12,6 +12,11 @@ mod server;
 #[cfg(not(any(target_os = "ios")))]
 pub use self::server::*;
 mod client;
+mod ios_clipboard;
+#[cfg(all(test, not(target_os = "ios")))]
+mod hdobby_security_tests;
+#[cfg(test)]
+mod hdobby_direct_tls_tests;
 mod lan;
 #[cfg(not(any(target_os = "ios")))]
 mod rendezvous_mediator;

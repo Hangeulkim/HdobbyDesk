@@ -61,13 +61,14 @@ class _DropDownAction extends StatelessWidget {
           final isAllowNumericOneTimePassword =
               gFFI.serverModel.allowNumericOneTimePassword;
           return [
-            if (!isChangeIdDisabled())
+            if (!gFFI.serverModel.directOnly && !isChangeIdDisabled())
               PopupMenuItem(
                 enabled: gFFI.serverModel.connectStatus > 0,
                 value: "changeID",
                 child: Text(translate("Change ID")),
               ),
-            if (!isChangeIdDisabled()) const PopupMenuDivider(),
+            if (!gFFI.serverModel.directOnly && !isChangeIdDisabled())
+              const PopupMenuDivider(),
             PopupMenuItem(
               value: 'AcceptSessionsViaPassword',
               child: listTile(
@@ -485,7 +486,16 @@ class ServerInfo extends StatelessWidget {
     }
 
     Widget ConnectionStateNotification() {
-      if (serverModel.connectStatus == -1) {
+      if (serverModel.directOnly) {
+        return Row(children: [
+          const Icon(Icons.link, color: Colors.blueGrey, size: iconSize)
+              .marginOnly(right: iconMarginRight),
+          Expanded(
+              child: Text(hdobbyLanguage(context).startsWith('ko')
+                  ? '직접 연결 모드 · “직접 연결 준비”에서 수신 상태를 확인하세요.'
+                  : 'Direct connection mode · Check the listener in “Prepare direct connection”.')),
+        ]);
+      } else if (serverModel.connectStatus == -1) {
         return Row(children: [
           const Icon(Icons.warning_amber_sharp,
                   color: colorNegative, size: iconSize)
@@ -514,27 +524,29 @@ class ServerInfo extends StatelessWidget {
         child: Column(
           // ID
           children: [
-            Row(children: [
-              const Icon(Icons.perm_identity,
-                      color: Colors.grey, size: iconSize)
-                  .marginOnly(right: iconMarginRight),
-              Text(
-                translate('ID'),
-                style: textStyleHeading,
-              )
-            ]),
-            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-              Text(
-                model.serverId.value.text,
-                style: textStyleValue,
-              ),
-              IconButton(
-                  visualDensity: VisualDensity.compact,
-                  icon: Icon(Icons.copy_outlined),
-                  onPressed: () {
-                    copyToClipboard(model.serverId.value.text.trim());
-                  })
-            ]).marginOnly(left: 39, bottom: 10),
+            if (!serverModel.directOnly) ...[
+              Row(children: [
+                const Icon(Icons.perm_identity,
+                        color: Colors.grey, size: iconSize)
+                    .marginOnly(right: iconMarginRight),
+                Text(
+                  translate('ID'),
+                  style: textStyleHeading,
+                )
+              ]),
+              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                Text(
+                  model.serverId.value.text,
+                  style: textStyleValue,
+                ),
+                IconButton(
+                    visualDensity: VisualDensity.compact,
+                    icon: Icon(Icons.copy_outlined),
+                    onPressed: () {
+                      copyToClipboard(model.serverId.value.text.trim());
+                    })
+              ]).marginOnly(left: 39, bottom: 10),
+            ],
             // Password
             Row(children: [
               const Icon(Icons.lock_outline, color: Colors.grey, size: iconSize)
@@ -925,6 +937,7 @@ void androidChannelInit() {
             break;
           }
         case "on_media_projection_canceled":
+        case "on_media_projection_stopped":
           {
             gFFI.serverModel.stopService();
             break;

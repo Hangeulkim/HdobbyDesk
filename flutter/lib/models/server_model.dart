@@ -33,6 +33,7 @@ class ServerModel with ChangeNotifier {
   bool _showElevation = false;
   bool hideCm = false;
   int _connectStatus = 0; // Rendezvous Server status
+  bool _directOnly = true;
   String _verificationMethod = "";
   String _temporaryPasswordLength = "";
   bool _allowNumericOneTimePassword = false;
@@ -67,6 +68,8 @@ class ServerModel with ChangeNotifier {
   bool get showElevation => _showElevation;
 
   int get connectStatus => _connectStatus;
+
+  bool get directOnly => _directOnly;
 
   String get verificationMethod {
     final index = [
@@ -418,9 +421,8 @@ class ServerModel with ChangeNotifier {
       if (bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) != 'Y') {
         await checkFloatingWindowPermission();
       }
-      if (!await AndroidPermissionManager.check(kManageExternalStorage)) {
-        await AndroidPermissionManager.request(kManageExternalStorage);
-      }
+      // Screen sharing does not need whole-device file access. Request storage
+      // only when the user enables file transfer in toggleFile().
       final res = await parent.target?.dialogManager
           .show<bool>((setState, close, context) {
         submit() => close(true);
@@ -441,7 +443,7 @@ class ServerModel with ChangeNotifier {
         );
       });
       if (res == true) {
-        startService();
+        await startService();
       }
     }
   }
@@ -473,8 +475,11 @@ class ServerModel with ChangeNotifier {
 
   fetchID() async {
     final id = await bind.mainGetMyId();
-    if (id != _serverId.id) {
+    final directOnly =
+        (await bind.mainGetOption(key: 'custom-rendezvous-server')).isEmpty;
+    if (id != _serverId.id || directOnly != _directOnly) {
       _serverId.id = id;
+      _directOnly = directOnly;
       notifyListeners();
     }
   }
@@ -574,7 +579,7 @@ class ServerModel with ChangeNotifier {
         _clients.removeAt(index_disconnected);
         tabController.remove(index_disconnected);
       }
-      if (desktopType == DesktopType.cm && !hideCm) {
+      if (desktopType == DesktopType.cm && !hideCm && !client.authorized) {
         showCmWindow();
       }
       scrollToBottom();
@@ -594,14 +599,20 @@ class ServerModel with ChangeNotifier {
         onTap: () {},
         page: desktop.buildConnectionCard(client)));
     Future.delayed(Duration.zero, () async {
-      if (!hideCm) windowOnTop(null);
+      if (!hideCm && !client.authorized) windowOnTop(null);
     });
     // Only do the hidden task when on Desktop.
     if (client.authorized && isDesktop) {
-      cmHiddenTimer = Timer(const Duration(seconds: 3), () {
-        if (!hideCm) windowManager.minimize();
-        cmHiddenTimer = null;
-      });
+      if (isWindows) {
+        // Keep the local management UI available from the tray, but remove its
+        // HWND from the captured desktop as soon as control is authorized.
+        unawaited(windowManager.hide());
+      } else {
+        cmHiddenTimer = Timer(const Duration(seconds: 3), () {
+          if (!hideCm) windowManager.minimize();
+          cmHiddenTimer = null;
+        });
+      }
     }
     parent.target?.chatModel
         .updateConnIdOfKey(MessageKey(client.peerId, client.id));
@@ -793,7 +804,7 @@ class ServerModel with ChangeNotifier {
             bind.mainGetLocalOption(key: kOptionKeepScreenOn));
     final on = ((keepScreenOn == KeepScreenOn.serviceOn) && _isStart) ||
         (keepScreenOn == KeepScreenOn.duringControlled &&
-            _clients.map((e) => !e.disconnected).isNotEmpty);
+            _clients.any((e) => e.authorized && !e.disconnected));
     if (on) {
       WakelockManager.enable(_wakelockKey, isServer: true);
     } else {

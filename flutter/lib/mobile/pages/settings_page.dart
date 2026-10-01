@@ -1,3 +1,4 @@
+import '../../hdobby/about.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
@@ -8,8 +9,6 @@ import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:settings_ui/settings_ui.dart';
-import 'package:url_launcher/url_launcher.dart';
-import 'package:url_launcher/url_launcher_string.dart';
 
 import '../../common.dart';
 import '../../common/widgets/dialog.dart';
@@ -35,8 +34,6 @@ class SettingsPage extends StatefulWidget implements PageShape {
   @override
   State<SettingsPage> createState() => _SettingsState();
 }
-
-const url = 'https://rustdesk.com/';
 
 enum KeepScreenOn {
   never,
@@ -142,8 +139,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     _enableIpv6Punch = mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
     _allowAskForNoteAtEndOfConnection =
         mainGetLocalBoolOptionSync(kOptionAllowAskForNoteAtEndOfConnection);
-    _preventSleepWhileConnected =
-        mainGetLocalBoolOptionSync(kOptionKeepAwakeDuringOutgoingSessions);
+    _preventSleepWhileConnected = keepAwakeDuringOutgoingSessionsEnabled();
     _showTerminalExtraKeys =
         mainGetLocalBoolOptionSync(kOptionEnableShowTerminalExtraKeys);
   }
@@ -530,7 +526,9 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
               title: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(translate('Keep RustDesk background service')),
+                    Text(hdobbyLanguage(context).startsWith('ko')
+                        ? 'HdobbyDesk 백그라운드 서비스 유지'
+                        : 'Keep HdobbyDesk background service'),
                     Text('* ${translate('Ignore Battery Optimizations')}',
                         style: Theme.of(context).textTheme.bodySmall),
                   ]),
@@ -954,17 +952,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           title: Text(translate("About")),
           tiles: [
             SettingsTile(
-                onPressed: (context) async {
-                  await launchUrl(Uri.parse(url));
-                },
-                title: Text(translate("Version: ") + version),
-                value: Padding(
-                  padding: EdgeInsets.symmetric(vertical: 8),
-                  child: Text('rustdesk.com',
-                      style: TextStyle(
-                        decoration: TextDecoration.underline,
-                      )),
-                ),
+                title: Text('HdobbyDesk'),
+                value: Text('${translate("Version")}: $version'),
                 leading: Icon(Icons.info)),
             SettingsTile(
                 title: Text(translate("Build Date")),
@@ -983,9 +972,11 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                   ),
                   leading: Icon(Icons.fingerprint)),
             SettingsTile(
-              title: Text(translate("Privacy Statement")),
-              onPressed: (context) =>
-                  launchUrlString('https://rustdesk.com/privacy.html'),
+              title: Text(hdobbyLanguage(context).startsWith('ko')
+                  ? '오픈소스 고지'
+                  : 'Open-source notices'),
+              onPressed: (context) => showHdobbyNotices(context,
+                  korean: hdobbyLanguage(context).startsWith('ko')),
               leading: Icon(Icons.privacy_tip),
             )
           ],
@@ -1093,21 +1084,18 @@ void showThemeSettings(OverlayDialogManager dialogManager) async {
 void showAbout(OverlayDialogManager dialogManager) {
   dialogManager.show((setState, close, context) {
     return CustomAlertDialog(
-      title: Text(translate('About RustDesk')),
+      title: Text(hdobbyAboutTitle(
+          korean: hdobbyLanguage(context).startsWith('ko'),
+          appName: bind.mainGetAppNameSync())),
       content: Wrap(direction: Axis.vertical, spacing: 12, children: [
         Text('Version: $version'),
-        InkWell(
-            onTap: () async {
-              const url = 'https://rustdesk.com/';
-              await launchUrl(Uri.parse(url));
-            },
-            child: Padding(
-              padding: EdgeInsets.symmetric(vertical: 8),
-              child: Text('rustdesk.com',
-                  style: TextStyle(
-                    decoration: TextDecoration.underline,
-                  )),
-            )),
+        TextButton(
+          onPressed: () => showHdobbyNotices(context,
+              korean: hdobbyLanguage(context).startsWith('ko')),
+          child: Text(hdobbyLanguage(context).startsWith('ko')
+              ? '오픈소스 고지'
+              : 'Open-source notices'),
+        ),
       ]),
       actions: [],
     );

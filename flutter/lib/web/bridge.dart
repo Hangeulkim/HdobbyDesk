@@ -50,7 +50,21 @@ class EventToUI_Texture implements EventToUI {
   bool get field1 => f1;
 }
 
-class RustdeskImpl {
+class HdobbydeskImpl {
+  Future<String> mainPrepareDirectTlsIdentity({dynamic hint}) => Future.error(
+      UnsupportedError('Use the native app to prepare direct TLS'));
+  Future<String> mainInspectDirectTlsPairing(
+          {required String code, dynamic hint}) =>
+      Future.error(UnsupportedError('Direct TLS requires the native app'));
+  Future<String> mainGetDirectTlsPairing(
+          {required String peer, dynamic hint}) =>
+      Future.error(UnsupportedError('Direct TLS requires the native app'));
+  Future<String> mainSaveDirectTlsPairing(
+          {required String peer,
+          required String code,
+          required String previous,
+          dynamic hint}) =>
+      Future.error(UnsupportedError('Direct TLS requires the native app'));
   Future<void> stopGlobalEventStream({required String appType, dynamic hint}) {
     throw UnimplementedError("stopGlobalEventStream");
   }
@@ -1608,8 +1622,8 @@ class RustdeskImpl {
   }
 
   bool isCustomClient({dynamic hint}) {
-    // is_custom_client() checks if app name is not "RustDesk"
-    return mainGetAppNameSync(hint: hint) != "RustDesk";
+    // is_custom_client() checks whether the app name differs from this build's base brand.
+    return mainGetAppNameSync(hint: hint) != "HdobbyDesk";
   }
 
   bool isDisableSettings({dynamic hint}) {
@@ -1915,12 +1929,15 @@ class RustdeskImpl {
   }
 
   Future<void> sessionSetCommon(
-      {required UuidValue sessionId, required String key, required String value, dynamic hint}) {
-      js.context.callMethod('setByName', [
-        'common',
-        jsonEncode({'name': key, 'value': value})
-      ]);
-      return Future.value();
+      {required UuidValue sessionId,
+      required String key,
+      required String value,
+      dynamic hint}) {
+    js.context.callMethod('setByName', [
+      'common',
+      jsonEncode({'name': key, 'value': value})
+    ]);
+    return Future.value();
   }
 
   String? sessionGetCommonSync(

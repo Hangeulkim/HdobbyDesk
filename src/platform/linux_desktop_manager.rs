@@ -728,7 +728,7 @@ impl DesktopManager {
     // on teardown reap the whole session scope subtree, not just the xorg + wm pids:
     // the per-session pipewire and other desktop children otherwise outlive them and
     // hold the logind session in "closing", leaking sockets + displays on reconnect
-    // (rustdesk/rustdesk#15183). SIGTERM first so pipewire unlinks its sockets, then
+    // (hdobbydesk/hdobbydesk#15183). SIGTERM first so pipewire unlinks its sockets, then
     // SIGKILL stragglers; skip our own pid (pam put the service in the scope too).
     fn reap_session_scope(scope_dir: &str) {
         if scope_dir.is_empty() {
@@ -848,7 +848,7 @@ impl DesktopManager {
     // a SIGKILL'd Xorg (how wait_x11_children_exit ends it) leaves "/tmp/.X<n>-lock" and
     // "/tmp/.X11-unix/X<n>" behind, and get_avail_display() treats either file as "display
     // in use", so the number is never reused and climbs until none are free
-    // (rustdesk/rustdesk#15183). a clean exit would remove them; do the same on teardown,
+    // (hdobbydesk/hdobbydesk#15183). a clean exit would remove them; do the same on teardown,
     // but skip it if a live process still holds the lock: another server could have taken
     // the number in the gap, and removing its files would break that display.
     fn cleanup_x_display_files(display_num: u32) {
@@ -914,7 +914,7 @@ impl DesktopManager {
     }
 
     // a run that dies before wait_stop_x11 (service or --server crash) leaks the headless
-    // session scope + X lock files, the same as a missed teardown (rustdesk/rustdesk#15183).
+    // session scope + X lock files, the same as a missed teardown (hdobbydesk/hdobbydesk#15183).
     // reap exactly what the dead run recorded - never a scan, so unrelated sessions are safe.
     fn recover_orphaned_session() {
         let marker = hbb_common::config::LocalConfig::get_option(Self::ORPHANED_SESSION_KEY);
@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     fn collect_scope_pids_walks_descendant_cgroups() {
         // regression for #15183: pids in descendant cgroups must be collected too
-        let base = std::env::temp_dir().join(format!("rustdesk-cgtest-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("hdobbydesk-cgtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let scope = base.join("session-3.scope");
         let child = scope.join("app-foo.scope");

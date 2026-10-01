@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
 
 import 'package:back_button_interceptor/back_button_interceptor.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -25,6 +24,8 @@ import 'package:uni_links/uni_links.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:uuid/uuid.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:hdobby_input/hdobby_input.dart'
+    show keepAwakeForOutgoingSession, safePeerDisplayLabel;
 import 'package:window_manager/window_manager.dart';
 import 'package:window_size/window_size.dart' as window_size;
 
@@ -744,12 +745,12 @@ Future<void> windowOnTop(int? id) async {
     }
     await windowManager.show();
     await windowManager.focus();
-    await rustDeskWinManager.registerActiveWindow(kWindowMainId);
+    await hdobbyDeskWinManager.registerActiveWindow(kWindowMainId);
   } else {
     WindowController.fromWindowId(id)
       ..focus()
       ..show();
-    rustDeskWinManager.call(WindowType.Main, kWindowEventShow, {"id": id});
+    hdobbyDeskWinManager.call(WindowType.Main, kWindowEventShow, {"id": id});
   }
 }
 
@@ -1280,22 +1281,23 @@ void msgBox(SessionID sessionId, String type, String title, String text,
           dialogManager.dismissAll();
         }));
   }
-  if (reconnect != null &&
-      title == "Connection Error" &&
-      reconnectTimeout != null) {
+  if (reconnect != null && title == "Connection Error") {
     // `enabled` is used to disable the dialog button once the button is clicked.
     final enabled = true.obs;
-    final button = Obx(() => _CountDownButton(
-          text: 'Reconnect',
-          second: reconnectTimeout,
-          onPressed: enabled.isTrue
-              ? () {
-                  // Disable the button
-                  enabled.value = false;
-                  reconnect(dialogManager, sessionId, false);
-                }
-              : null,
-        ));
+    final button = Obx(() {
+      final onPressed = enabled.isTrue
+          ? () {
+              enabled.value = false;
+              reconnect(dialogManager, sessionId, false);
+            }
+          : null;
+      return reconnectTimeout == null
+          ? dialogButton('Reconnect', onPressed: onPressed)
+          : _CountDownButton(
+              text: 'Reconnect',
+              second: reconnectTimeout,
+              onPressed: onPressed);
+    });
     buttons.insert(0, button);
   }
   if (link.isNotEmpty) {
@@ -1470,52 +1472,6 @@ String readableFileSize(double size) {
   }
 }
 
-/// Flutter can't not catch PointerMoveEvent when size is 1
-/// This will happen in Android AccessibilityService Input
-/// android can't init dispatching size yet ,see: https://stackoverflow.com/questions/59960451/android-accessibility-dispatchgesture-is-it-possible-to-specify-pressure-for-a
-/// use this temporary solution until flutter or android fixes the bug
-class AccessibilityListener extends StatelessWidget {
-  final Widget? child;
-  static final offset = 100;
-
-  AccessibilityListener({this.child});
-
-  @override
-  Widget build(BuildContext context) {
-    return Listener(
-        onPointerDown: (evt) {
-          if (evt.size == 1) {
-            GestureBinding.instance.handlePointerEvent(PointerAddedEvent(
-                pointer: evt.pointer + offset, position: evt.position));
-            GestureBinding.instance.handlePointerEvent(PointerDownEvent(
-                pointer: evt.pointer + offset,
-                size: 0.1,
-                position: evt.position));
-          }
-        },
-        onPointerUp: (evt) {
-          if (evt.size == 1) {
-            GestureBinding.instance.handlePointerEvent(PointerUpEvent(
-                pointer: evt.pointer + offset,
-                size: 0.1,
-                position: evt.position));
-            GestureBinding.instance.handlePointerEvent(PointerRemovedEvent(
-                pointer: evt.pointer + offset, position: evt.position));
-          }
-        },
-        onPointerMove: (evt) {
-          if (evt.size == 1) {
-            GestureBinding.instance.handlePointerEvent(PointerMoveEvent(
-                pointer: evt.pointer + offset,
-                size: 0.1,
-                delta: evt.delta,
-                position: evt.position));
-          }
-        },
-        child: child);
-  }
-}
-
 class AndroidPermissionManager {
   static Completer<bool>? _completer;
   static Timer? _timer;
@@ -1547,8 +1503,6 @@ class AndroidPermissionManager {
       return Future.value(true);
     }
 
-    gFFI.invokeMethod("request_permission", type);
-
     // clear last task
     if (_completer?.isCompleted == false) {
       _completer?.complete(false);
@@ -1557,6 +1511,9 @@ class AndroidPermissionManager {
 
     _current = type;
     _completer = Completer<bool>();
+
+    // Register the pending request before native code can report an existing grant.
+    gFFI.invokeMethod("request_permission", type);
 
     _timer = Timer(Duration(seconds: 120), () {
       if (_completer == null) return;
@@ -1570,11 +1527,12 @@ class AndroidPermissionManager {
   }
 
   static complete(String type, bool res) {
-    if (type != _current) {
-      res = false;
-    }
+    // A late or duplicate callback must not finish a different permission request.
+    if (type != _current || _completer == null || _completer!.isCompleted)
+      return;
     _timer?.cancel();
     _completer?.complete(res);
+    _completer = null;
     _current = "";
   }
 }
@@ -1610,6 +1568,14 @@ Future<void> initGlobalFFI() async {
   debugPrint("_globalFFI init end");
   // after `put`, can also be globally found by Get.find<FFI>();
   Get.put<FFI>(_globalFFI, permanent: true);
+}
+
+/// Custom copy follows the app language, including an explicit user override.
+String hdobbyLanguage(BuildContext context) {
+  final configured = bind.mainGetLocalOption(key: kCommConfKeyLang);
+  return configured.isEmpty
+      ? Localizations.localeOf(context).languageCode
+      : configured;
 }
 
 String translate(String name) {
@@ -2034,7 +2000,7 @@ Future<Offset?> _adjustRestoreMainWindowOffset(
 Future<bool> restoreWindowPosition(WindowType type,
     {int? windowId, String? peerId, int? display}) async {
   if (bind
-      .mainGetEnv(key: "DISABLE_RUSTDESK_RESTORE_WINDOW_POSITION")
+      .mainGetEnv(key: "DISABLE_HDOBBYDESK_RESTORE_WINDOW_POSITION")
       .isNotEmpty) {
     return false;
   }
@@ -2352,7 +2318,7 @@ bool handleUriLink({List<String>? cmdArgs, Uri? uri, String? uriString}) {
     switch (type) {
       case UriLinkType.remoteDesktop:
         Future.delayed(Duration.zero, () {
-          rustDeskWinManager.newRemoteDesktop(id!,
+          hdobbyDeskWinManager.newRemoteDesktop(id!,
               password: password,
               switchUuid: switchUuid,
               forceRelay: forceRelay);
@@ -2360,31 +2326,31 @@ bool handleUriLink({List<String>? cmdArgs, Uri? uri, String? uriString}) {
         break;
       case UriLinkType.fileTransfer:
         Future.delayed(Duration.zero, () {
-          rustDeskWinManager.newFileTransfer(id!,
+          hdobbyDeskWinManager.newFileTransfer(id!,
               password: password, forceRelay: forceRelay);
         });
         break;
       case UriLinkType.viewCamera:
         Future.delayed(Duration.zero, () {
-          rustDeskWinManager.newViewCamera(id!,
+          hdobbyDeskWinManager.newViewCamera(id!,
               password: password, forceRelay: forceRelay);
         });
         break;
       case UriLinkType.portForward:
         Future.delayed(Duration.zero, () {
-          rustDeskWinManager.newPortForward(id!, false,
+          hdobbyDeskWinManager.newPortForward(id!, false,
               password: password, forceRelay: forceRelay);
         });
         break;
       case UriLinkType.rdp:
         Future.delayed(Duration.zero, () {
-          rustDeskWinManager.newPortForward(id!, true,
+          hdobbyDeskWinManager.newPortForward(id!, true,
               password: password, forceRelay: forceRelay);
         });
         break;
       case UriLinkType.terminal:
         Future.delayed(Duration.zero, () {
-          rustDeskWinManager.newTerminal(id!,
+          hdobbyDeskWinManager.newTerminal(id!,
               password: password, forceRelay: forceRelay);
         });
         break;
@@ -2423,7 +2389,7 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
               'Y';
       if (!allowDeepLinkServerSettings) {
         debugPrint(
-            "Ignore rustdesk://config because $kOptionAllowDeepLinkServerSettings is not enabled.");
+            "Ignore hdobbydesk://config because $kOptionAllowDeepLinkServerSettings is not enabled.");
         // Keep the user-facing error generic; detailed rejection reason is in debug logs.
         // Delay toast to avoid missing overlay during cold-start deeplink handling.
         Timer(Duration(seconds: 1), () {
@@ -2444,7 +2410,7 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
           bind.mainGetBuildinOption(key: kOptionAllowDeepLinkPassword) == 'Y';
       if (!allowDeepLinkPassword) {
         debugPrint(
-            "Ignore rustdesk://password because $kOptionAllowDeepLinkPassword is not enabled.");
+            "Ignore hdobbydesk://password because $kOptionAllowDeepLinkPassword is not enabled.");
         // Keep the user-facing error generic; detailed rejection reason is in debug logs.
         // Delay toast to avoid missing overlay during cold-start deeplink handling.
         Timer(Duration(seconds: 1), () {
@@ -2469,9 +2435,9 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
   } else if (uri.authority.length > 2 &&
       (uri.path.length <= 1 ||
           (uri.path == '/r' || uri.path.startsWith('/r@')))) {
-    // rustdesk://<connect-id>
-    // rustdesk://<connect-id>/r
-    // rustdesk://<connect-id>/r@<server>
+    // hdobbydesk://<connect-id>
+    // hdobbydesk://<connect-id>/r
+    // hdobbydesk://<connect-id>/r@<server>
     command = '--connect';
     id = uri.authority;
     if (uri.path.length > 1) {
@@ -2541,31 +2507,31 @@ connectMainDesktop(String id,
     String? connToken,
     bool? isSharedPassword}) async {
   if (isFileTransfer) {
-    await rustDeskWinManager.newFileTransfer(id,
+    await hdobbyDeskWinManager.newFileTransfer(id,
         password: password,
         isSharedPassword: isSharedPassword,
         connToken: connToken,
         forceRelay: forceRelay);
   } else if (isViewCamera) {
-    await rustDeskWinManager.newViewCamera(id,
+    await hdobbyDeskWinManager.newViewCamera(id,
         password: password,
         isSharedPassword: isSharedPassword,
         connToken: connToken,
         forceRelay: forceRelay);
   } else if (isTcpTunneling || isRDP) {
-    await rustDeskWinManager.newPortForward(id, isRDP,
+    await hdobbyDeskWinManager.newPortForward(id, isRDP,
         password: password,
         isSharedPassword: isSharedPassword,
         connToken: connToken,
         forceRelay: forceRelay);
   } else if (isTerminal) {
-    await rustDeskWinManager.newTerminal(id,
+    await hdobbyDeskWinManager.newTerminal(id,
         password: password,
         isSharedPassword: isSharedPassword,
         connToken: connToken,
         forceRelay: forceRelay);
   } else {
-    await rustDeskWinManager.newRemoteDesktop(id,
+    await hdobbyDeskWinManager.newRemoteDesktop(id,
         password: password,
         isSharedPassword: isSharedPassword,
         forceRelay: forceRelay);
@@ -2621,7 +2587,7 @@ connect(BuildContext context, String id,
         forceRelay: forceRelay,
       );
     } else {
-      await rustDeskWinManager.call(WindowType.Main, kWindowConnect, {
+      await hdobbyDeskWinManager.call(WindowType.Main, kWindowConnect, {
         'id': id,
         'isFileTransfer': isFileTransfer,
         'isViewCamera': isViewCamera,
@@ -2773,8 +2739,7 @@ class WakelockManager {
   static void enable(UniqueKey key, {bool isServer = false}) {
     // Check if we should keep awake during outgoing sessions
     if (!isServer) {
-      final keepAwake =
-          mainGetLocalBoolOptionSync(kOptionKeepAwakeDuringOutgoingSessions);
+      final keepAwake = keepAwakeDuringOutgoingSessionsEnabled();
       if (!keepAwake) {
         return; // Don't enable wakelock if user disabled keep awake
       }
@@ -2801,6 +2766,12 @@ class WakelockManager {
     }
   }
 }
+
+bool keepAwakeDuringOutgoingSessionsEnabled() => keepAwakeForOutgoingSession(
+      isMobile: isMobile,
+      storedValue:
+          bind.mainGetLocalOption(key: kOptionKeepAwakeDuringOutgoingSessions),
+    );
 
 /// call this to reload current window.
 ///
@@ -2843,22 +2814,22 @@ bool isRunningInPortableMode() {
 /// Window status callback
 Future<void> onActiveWindowChanged() async {
   print(
-      "[MultiWindowHandler] active window changed: ${rustDeskWinManager.getActiveWindows()}");
-  if (rustDeskWinManager.getActiveWindows().isEmpty) {
+      "[MultiWindowHandler] active window changed: ${hdobbyDeskWinManager.getActiveWindows()}");
+  if (hdobbyDeskWinManager.getActiveWindows().isEmpty) {
     // close all sub windows
     try {
       if (isLinux) {
         await Future.wait([
           saveWindowPosition(WindowType.Main),
-          rustDeskWinManager.closeAllSubWindows()
+          hdobbyDeskWinManager.closeAllSubWindows()
         ]);
       } else {
-        await rustDeskWinManager.closeAllSubWindows();
+        await hdobbyDeskWinManager.closeAllSubWindows();
       }
     } catch (err) {
       debugPrintStack(label: "$err");
     } finally {
-      debugPrint("Start closing RustDesk...");
+      debugPrint("Start closing HdobbyDesk...");
       await windowManager.setPreventClose(false);
       await windowManager.close();
       if (isMacOS) {
@@ -3075,7 +3046,7 @@ Future<void> updateSystemWindowTheme() async {
 ///
 /// Note: not found a general solution for rust based AVFoundation bingding.
 /// [AVFoundation] crate has compile error.
-const kMacOSPermChannel = MethodChannel("org.rustdesk.rustdesk/host");
+const kMacOSPermChannel = MethodChannel("org.hdobby.hdobbydesk/host");
 
 enum PermissionAuthorizeType {
   undetermined,
@@ -3137,7 +3108,7 @@ Future<void> start_service(bool is_start) async {
       !isMacOS ||
       await callMainCheckSuperUserPermission();
   if (checked) {
-    mainSetBoolOption(kOptionStopService, !is_start);
+    await mainSetBoolOption(kOptionStopService, !is_start);
   }
 }
 
@@ -3304,21 +3275,21 @@ Widget buildErrorBanner(BuildContext context,
 }
 
 String getDesktopTabLabel(String peerId, String alias) {
-  String label = alias.isEmpty ? peerId : alias;
+  var hostname = '';
   try {
     String peer = bind.mainGetPeerSync(id: peerId);
     Map<String, dynamic> config = jsonDecode(peer);
     if (config['info']['hostname'] is String) {
-      String hostname = config['info']['hostname'];
-      if (hostname.isNotEmpty &&
-          !label.toLowerCase().contains(hostname.toLowerCase())) {
-        label += "@$hostname";
-      }
+      hostname = config['info']['hostname'];
     }
   } catch (e) {
     debugPrint("Failed to get hostname:$e");
   }
-  return label;
+  return safePeerDisplayLabel(
+      peerId: peerId,
+      alias: alias,
+      hostname: hostname,
+      fallback: translate('Remote device'));
 }
 
 sessionRefreshVideo(SessionID sessionId, PeerInfo pi) async {
@@ -3344,7 +3315,7 @@ Future<List<Rect>> getScreenListWayland() async {
       screenRectList.add(rect);
     }
   } else {
-    final screenList = await rustDeskWinManager.call(
+    final screenList = await hdobbyDeskWinManager.call(
         WindowType.Main, kWindowGetScreenList, '');
     try {
       for (var screen in jsonDecode(screenList.result) as List<dynamic>) {
@@ -3736,29 +3707,7 @@ Color? disabledTextColor(BuildContext context, bool enabled) {
       : Theme.of(context).textTheme.titleLarge?.color?.withOpacity(0.6);
 }
 
-Widget loadPowered(BuildContext context) {
-  if (bind.mainGetBuildinOption(key: "hide-powered-by-me") == 'Y') {
-    return SizedBox.shrink();
-  }
-  return MouseRegion(
-    cursor: SystemMouseCursors.click,
-    child: GestureDetector(
-      onTap: () {
-        launchUrl(Uri.parse('https://rustdesk.com'));
-      },
-      child: Opacity(
-          opacity: 0.5,
-          child: Text(
-            translate("powered_by_me"),
-            overflow: TextOverflow.clip,
-            style: Theme.of(context)
-                .textTheme
-                .bodySmall
-                ?.copyWith(fontSize: 9, decoration: TextDecoration.underline),
-          )),
-    ),
-  ).marginOnly(top: 6);
-}
+Widget loadPowered(BuildContext context) => const SizedBox.shrink();
 
 const _kDefaultLogoAsset = 'assets/logo.png';
 const _kLightLogoAsset = 'assets/logo_light.png';

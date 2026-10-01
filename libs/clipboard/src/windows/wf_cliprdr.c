@@ -2574,7 +2574,7 @@ static UINT wf_cliprdr_server_format_list(CliprdrClientContext *context,
 			UINT32 *p_conn_id = (UINT32 *)calloc(1, sizeof(UINT32));
 			if (p_conn_id) {
 				*p_conn_id = formatList->connID;
-				if (PostMessage(clipboard->hwnd, WM_CLIPRDR_MESSAGE, OLE_SETCLIPBOARD, p_conn_id))
+				if (PostMessage(clipboard->hwnd, WM_CLIPRDR_MESSAGE, OLE_SETCLIPBOARD, (LPARAM)p_conn_id))
 					rc = CHANNEL_RC_OK;
 			}
 		}
@@ -2608,7 +2608,7 @@ static UINT wf_cliprdr_server_format_list(CliprdrClientContext *context,
 						{
 							format_ids->formats[i] = clipboard->format_mappings[i].local_format_id;
 						}
-						if (PostMessage(clipboard->hwnd, WM_CLIPRDR_MESSAGE, DELAYED_RENDERING, format_ids))
+						if (PostMessage(clipboard->hwnd, WM_CLIPRDR_MESSAGE, DELAYED_RENDERING, (LPARAM)format_ids))
 						{
 							rc = CHANNEL_RC_OK;
 						}
@@ -3370,7 +3370,7 @@ BOOL wf_cliprdr_init(wfClipboard *clipboard, CliprdrClientContext *cliprdr)
 		goto error;
 	clipboard->formatDataRespReceived = FALSE;
 
-	if (!(clipboard->data_obj_mutex = CreateMutex(NULL, FALSE, "data_obj_mutex")))
+	if (!(clipboard->data_obj_mutex = CreateMutex(NULL, FALSE, L"data_obj_mutex")))
 		goto error;
 
 	if (!(clipboard->req_fevent = CreateEvent(NULL, TRUE, FALSE, NULL)))
@@ -3487,7 +3487,7 @@ BOOL empty_cliprdr(CliprdrClientContext *context, UINT32 connID)
 		return FALSE;
 	}
 
-	instance = clipboard->data_obj;
+	instance = (CliprdrDataObject *)clipboard->data_obj;
 	if (instance)
 	{
 		if (instance->m_connID != connID)

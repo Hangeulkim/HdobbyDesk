@@ -36,8 +36,9 @@ const INVALID_DISPLAY_IDX: i32 = -1;
 #[derive(Default)]
 struct StateCursor {
     hcursor: u64,
+    text_input_focused: bool,
     cursor_data: Arc<Message>,
-    cached_cursor_data: HashMap<u64, Arc<Message>>,
+    cached_cursor_data: HashMap<(u64, bool), Arc<Message>>,
 }
 
 impl super::service::Reset for StateCursor {
@@ -118,7 +119,7 @@ const XKB_KEY_INSERT: u16 = evdev::Key::KEY_INSERT.code() + 8;
 #[derive(Clone, Default)]
 pub struct MouseCursorSub {
     inner: ConnInner,
-    cached: HashMap<u64, Arc<Message>>,
+    cached: HashMap<u64, (bool, Arc<Message>)>,
 }
 
 impl From<ConnInner> for MouseCursorSub {
@@ -139,15 +140,18 @@ impl Subscriber for MouseCursorSub {
     #[inline]
     fn send(&mut self, msg: Arc<Message>) {
         if let Some(message::Union::CursorData(cd)) = &msg.union {
-            if let Some(msg) = self.cached.get(&cd.id) {
-                self.inner.send(msg.clone());
-            } else {
-                self.inner.send(msg.clone());
-                let mut tmp = Message::new();
-                // only send id out, require client side cache also
-                tmp.set_cursor_id(cd.id);
-                self.cached.insert(cd.id, Arc::new(tmp));
+            if let Some((text_input_cursor, cursor_id)) = self.cached.get(&cd.id) {
+                if *text_input_cursor == cd.text_input_cursor {
+                    self.inner.send(cursor_id.clone());
+                    return;
+                }
             }
+            self.inner.send(msg.clone());
+            let mut tmp = Message::new();
+            // Only reuse the cached cursor ID while its text-input state agrees.
+            tmp.set_cursor_id(cd.id);
+            self.cached
+                .insert(cd.id, (cd.text_input_cursor, Arc::new(tmp)));
         } else {
             self.inner.send(msg);
         }
@@ -394,21 +398,29 @@ fn run_pos(sp: EmptyExtraFieldService, state: &mut StatePos) -> ResultType<()> {
 
 fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()> {
     if let Some(hcursor) = crate::get_cursor()? {
-        if hcursor != state.hcursor {
+        #[cfg(windows)]
+        let text_input_focused = crate::platform::is_text_input_focused();
+        #[cfg(not(windows))]
+        let text_input_focused = false;
+        if hcursor != state.hcursor || text_input_focused != state.text_input_focused {
             let msg;
-            if let Some(cached) = state.cached_cursor_data.get(&hcursor) {
+            if let Some(cached) = state.cached_cursor_data.get(&(hcursor, text_input_focused)) {
                 super::log::trace!("Cursor data cached, hcursor: {}", hcursor);
                 msg = cached.clone();
             } else {
                 let mut data = crate::get_cursor_data(hcursor)?;
+                data.text_input_cursor |= text_input_focused;
                 data.colors = hbb_common::compress::compress(&data.colors[..]).into();
                 let mut tmp = Message::new();
                 tmp.set_cursor_data(data);
                 msg = Arc::new(tmp);
-                state.cached_cursor_data.insert(hcursor, msg.clone());
+                state
+                    .cached_cursor_data
+                    .insert((hcursor, text_input_focused), msg.clone());
                 super::log::trace!("Cursor data updated, hcursor: {}", hcursor);
             }
             state.hcursor = hcursor;
+            state.text_input_focused = text_input_focused;
             sp.send_shared(msg.clone());
             state.cursor_data = msg;
         }
@@ -576,14 +588,14 @@ impl VirtualInputState {
             // Note: `CGEventTapLocation::Session` will be affected by the mouse events.
             // When we're simulating key events, then move the physical mouse, the key events will be affected.
             // It looks like https://github.com/rustdesk/rustdesk/issues/9729#issuecomment-2432306822
-            // 1. Press "Command" key in RustDesk
+            // 1. Press "Command" key in HdobbyDesk
             // 2. Move the physical mouse
-            // 3. Press "V" key in RustDesk
+            // 3. Press "V" key in HdobbyDesk
             // Then the controlled side just prints "v" instead of pasting.
             //
             // Changing `CGEventTapLocation::Session` to `CGEventTapLocation::HID` fixes it.
             // But we do not consider this as a bug, because it's not a common case,
-            // we consider only RustDesk operates the controlled side.
+            // we consider only HdobbyDesk operates the controlled side.
             //
             // https://developer.apple.com/documentation/coregraphics/cgeventtaplocation/
             CGEventTapLocation::Session,
@@ -712,11 +724,11 @@ fn is_pressed(key: &Key, en: &mut Enigo) -> bool {
 #[inline]
 #[cfg(target_os = "macos")]
 fn key_sleep() {
-    // https://www.reddit.com/r/rustdesk/comments/1kn1w5x/typing_lags_when_connecting_to_macos_clients/
+    // https://www.reddit.com/r/hdobbydesk/comments/1kn1w5x/typing_lags_when_connecting_to_macos_clients/
     //
     // There's a strange bug when running by `launchctl load -w /Library/LaunchAgents/abc.plist`
     // `std::thread::sleep(Duration::from_millis(20));` may sleep 90ms or more.
-    // Though `/Applications/RustDesk.app/Contents/MacOS/rustdesk --server` in terminal is ok.
+    // Though `/Applications/HdobbyDesk.app/Contents/MacOS/hdobbydesk --server` in terminal is ok.
     let now = Instant::now();
     while now.elapsed() < Duration::from_millis(12) {
         std::thread::sleep(Duration::from_millis(1));
@@ -1065,15 +1077,47 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         return;
     }
 
+    let evt_type = evt.mask & MOUSE_TYPE_MASK;
+    #[cfg(windows)]
+    if evt_type != MOUSE_TYPE_UP {
+        let target = if evt_type == MOUSE_TYPE_MOVE || evt.position_valid {
+            Some((evt.x, evt.y))
+        } else {
+            crate::get_cursor_pos()
+        };
+        if target
+            .map(|(x, y)| crate::platform::windows::is_management_window_at(x, y))
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+
     #[cfg(windows)]
     crate::platform::windows::try_change_desktop();
     let buttons = evt.mask >> 3;
-    let evt_type = evt.mask & MOUSE_TYPE_MASK;
     let mut en = ENIGO.lock().unwrap();
     #[cfg(target_os = "macos")]
     en.set_ignore_flags(enigo_ignore_flags());
     #[cfg(not(target_os = "macos"))]
     let mut to_release = Vec::new();
+    if evt.position_valid
+        && matches!(
+            evt_type,
+            MOUSE_TYPE_DOWN | MOUSE_TYPE_WHEEL | MOUSE_TYPE_TRACKPAD
+        )
+    {
+        // Collaborative presence cursors do not move the system cursor while
+        // hovering. Move and perform the action under the same ENIGO lock so
+        // another connection cannot split an atomic click into two locations.
+        en.mouse_move_to(evt.x, evt.y);
+        *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
+            conn,
+            time: get_time(),
+            x: evt.x,
+            y: evt.y,
+        };
+    }
     if evt_type == MOUSE_TYPE_DOWN {
         fix_modifiers(&evt.modifiers[..], &mut en, 0);
         #[cfg(target_os = "macos")]
@@ -1299,7 +1343,7 @@ pub async fn lock_screen() {
     cfg_if::cfg_if! {
     if #[cfg(target_os = "linux")] {
         // xdg_screensaver lock not work on Linux from our service somehow
-        // loginctl lock-session also not work, they both work run rustdesk from cmd
+        // loginctl lock-session also not work, they both work run hdobbydesk from cmd
         std::thread::spawn(|| {
             let mut key_event = KeyEvent::new();
 
@@ -2238,6 +2282,11 @@ fn is_legacy_mode(evt: &KeyEvent) -> bool {
 
 pub fn handle_key_(evt: &KeyEvent) {
     if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
+
+    #[cfg(windows)]
+    if evt.down && crate::platform::windows::is_management_window_foreground() {
         return;
     }
 

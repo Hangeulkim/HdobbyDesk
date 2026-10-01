@@ -48,7 +48,7 @@ use hbb_common::{
     bail,
     config::{
         self, keys, use_ws, Config, LocalConfig, PeerConfig, PeerInfoSerde, Resolution,
-        CONNECT_TIMEOUT, READ_TIMEOUT, RELAY_PORT, RENDEZVOUS_PORT, RENDEZVOUS_SERVERS,
+        CONNECT_TIMEOUT, READ_TIMEOUT, RELAY_PORT, RENDEZVOUS_PORT,
     },
     fs::JobType,
     futures::future::{select_ok, FutureExt},
@@ -123,11 +123,9 @@ pub const LOGIN_SCREEN_WAYLAND: &str = "Wayland login screen is not supported";
 #[cfg(target_os = "linux")]
 pub const SCRAP_UBUNTU_HIGHER_REQUIRED: &str = "ubuntu-21-04-required";
 #[cfg(target_os = "linux")]
-pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str =
-    "wayland-requires-higher-linux-version";
+pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str = "wayland-requires-higher-linux-version";
 #[cfg(target_os = "linux")]
-pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
-    "xdp-portal-unavailable";
+pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str = "xdp-portal-unavailable";
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
@@ -255,32 +253,28 @@ impl Client {
         if config::is_incoming_only() {
             bail!("Incoming only mode");
         }
-        // to-do: remember the port for each peer, so that we can retry easier
-        if hbb_common::is_ip_str(peer) {
+        if hbb_common::is_ip_str(peer)
+            || hbb_common::is_domain_port_str(peer)
+            || peer.parse::<std::net::IpAddr>().is_ok()
+            || peer.parse::<std::net::SocketAddr>().is_ok()
+            || peer.starts_with("localhost:")
+        {
+            let pairing = interface
+                .get_lch()
+                .read()
+                .unwrap()
+                .config
+                .options
+                .get(hbb_common::direct_tls::PEER_CERT_OPTION)
+                .cloned()
+                .unwrap_or_default();
+            // Validate trust before DNS or TCP. Missing pairing cannot start an insecure session.
+            let trust = hbb_common::direct_tls::PeerTrust::from_pairing_code(&pairing)?;
+            let endpoint = hbb_common::direct_tls::endpoint(peer)?;
+            let stream = hbb_common::direct_tls::connect(&endpoint, trust, CONNECT_TIMEOUT).await?;
             return Ok((
-                (
-                    connect_tcp_local(check_port(peer, RELAY_PORT + 1), None, CONNECT_TIMEOUT)
-                        .await?,
-                    true,
-                    None,
-                    None,
-                    "TCP",
-                ),
-                (0, "".to_owned()),
-                false,
-            ));
-        }
-        // Allow connect to {domain}:{port}
-        if hbb_common::is_domain_port_str(peer) {
-            return Ok((
-                (
-                    connect_tcp_local(peer, None, CONNECT_TIMEOUT).await?,
-                    true,
-                    None,
-                    None,
-                    "TCP",
-                ),
-                (0, "".to_owned()),
+                (stream, true, None, None, "TLS 1.3"),
+                (0, String::new()),
                 false,
             ));
         }
@@ -295,18 +289,17 @@ impl Client {
             crate::get_rendezvous_server(1_000).await
         } else {
             if other_server == PUBLIC_SERVER {
-                (
-                    check_port(RENDEZVOUS_SERVERS[0], RENDEZVOUS_PORT),
-                    RENDEZVOUS_SERVERS[1..]
-                        .iter()
-                        .map(|x| x.to_string())
-                        .collect(),
-                    true,
-                )
+                bail!("Public rendezvous servers are disabled");
             } else {
+                if hbb_common::private_network::explicit_endpoint(other_server).is_none() {
+                    bail!("Configure your own ID server before connecting");
+                }
                 (check_port(other_server, RENDEZVOUS_PORT), Vec::new(), true)
             }
         };
+        if hbb_common::private_network::explicit_endpoint(&rendezvous_server).is_none() {
+            bail!("Configure your own ID server before connecting");
+        }
 
         if crate::get_ipv6_punch_enabled() {
             crate::test_ipv6().await;
@@ -509,7 +502,10 @@ impl Client {
                             peer_nat_type = ph.nat_type();
                             is_local = ph.is_local();
                             signed_id_pk = ph.pk.into();
-                            relay_server = ph.relay_server;
+                            // A server response alone cannot authorize use of a relay.
+                            if crate::configured_relay_allowed(&ph.relay_server) {
+                                relay_server = ph.relay_server;
+                            }
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
                             let s = udp.0.take();
@@ -689,7 +685,7 @@ impl Client {
                 connect_timeout = MIN;
             }
         }
-        log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
+        log::info!("Direct connection attempt timeout: {} ms", connect_timeout);
         let start = std::time::Instant::now();
 
         let mut connect_futures = Vec::new();
@@ -757,82 +753,40 @@ impl Client {
     }
 
     /// Establish secure connection with the server.
-    async fn secure_connection(
+    pub(crate) async fn secure_connection(
         peer_id: &str,
         signed_id_pk: Vec<u8>,
         key: &str,
         conn: &mut Stream,
     ) -> ResultType<Option<Vec<u8>>> {
-        let rs_pk = get_rs_pk(if key.is_empty() {
-            config::RS_PUB_KEY
-        } else {
-            key
-        });
-        let mut sign_pk = None;
-        let mut option_pk = None;
-        if !signed_id_pk.is_empty() {
-            if let Some(rs_pk) = rs_pk {
-                if let Ok((id, pk)) = decode_id_pk(&signed_id_pk, &rs_pk) {
-                    if id == peer_id {
-                        sign_pk = Some(sign::PublicKey(pk));
-                        option_pk = Some(pk.to_vec());
-                    }
-                }
-            }
-            if sign_pk.is_none() {
-                log::error!("Handshake failed: invalid public key from rendezvous server");
-            }
+        let rs_pk = get_rs_pk(key).ok_or_else(|| {
+            anyhow!("Configure and verify your ID server public key before connecting")
+        })?;
+        let (signed_peer_id, peer_pk) = decode_id_pk(&signed_id_pk, &rs_pk)?;
+        if signed_peer_id != peer_id {
+            bail!("Handshake failed: peer identity mismatch");
         }
-        let sign_pk = match sign_pk {
-            Some(v) => v,
-            None => {
-                // send an empty message out in case server is setting up secure and waiting for first message
-                conn.send(&Message::new()).await?;
-                return Ok(option_pk);
-            }
+        let bytes = timeout(READ_TIMEOUT, conn.next())
+            .await?
+            .ok_or_else(|| anyhow!("Reset by the peer"))??;
+        let msg_in = Message::parse_from_bytes(&bytes)?;
+        let Some(message::Union::SignedId(si)) = msg_in.union else {
+            bail!("Handshake failed: expected authenticated peer identity");
         };
-        match timeout(READ_TIMEOUT, conn.next()).await? {
-            Some(res) => {
-                let bytes = res?;
-                if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
-                    if let Some(message::Union::SignedId(si)) = msg_in.union {
-                        if let Ok((id, their_pk_b)) = decode_id_pk(&si.id, &sign_pk) {
-                            if id == peer_id {
-                                let (asymmetric_value, symmetric_value, key) =
-                                    create_symmetric_key_msg(their_pk_b);
-                                let mut msg_out = Message::new();
-                                msg_out.set_public_key(PublicKey {
-                                    asymmetric_value,
-                                    symmetric_value,
-                                    ..Default::default()
-                                });
-                                timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
-                                conn.set_key(key);
-                            } else {
-                                log::error!("Handshake failed: sign failure");
-                                conn.send(&Message::new()).await?;
-                            }
-                        } else {
-                            // fall back to non-secure connection in case pk mismatch
-                            log::info!("pk mismatch, fall back to non-secure");
-                            let mut msg_out = Message::new();
-                            msg_out.set_public_key(PublicKey::new());
-                            conn.send(&msg_out).await?;
-                        }
-                    } else {
-                        log::error!("Handshake failed: invalid message type");
-                        conn.send(&Message::new()).await?;
-                    }
-                } else {
-                    log::error!("Handshake failed: invalid message format");
-                    conn.send(&Message::new()).await?;
-                }
-            }
-            None => {
-                bail!("Reset by the peer");
-            }
+        let (id, their_pk_b) = decode_id_pk(&si.id, &sign::PublicKey(peer_pk))?;
+        if id != peer_id {
+            bail!("Handshake failed: peer identity mismatch");
         }
-        Ok(option_pk)
+        let (asymmetric_value, symmetric_value, session_key) = create_symmetric_key_msg(their_pk_b);
+        let mut msg_out = Message::new();
+        msg_out.set_public_key(PublicKey {
+            asymmetric_value,
+            symmetric_value,
+            ..Default::default()
+        });
+        timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
+        conn.set_key(session_key);
+        Ok(Some(peer_pk.to_vec()))
     }
 
     /// Request a relay connection to the server.
@@ -908,6 +862,9 @@ impl Client {
         conn_type: ConnType,
         ipv4: bool,
     ) -> ResultType<Stream> {
+        if !crate::configured_relay_allowed(&relay_server) {
+            bail!("Relay is disabled or does not match your configured relay server");
+        }
         let mut conn = connect_tcp(
             ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
             CONNECT_TIMEOUT,
@@ -1115,7 +1072,7 @@ impl ClientClipboardHandler {
             if let Some(urls) = check_clipboard_files(&mut self.ctx, ClipboardSide::Client, false) {
                 if !urls.is_empty() {
                     #[cfg(target_os = "macos")]
-                    if crate::clipboard::is_file_url_set_by_rustdesk(&urls) {
+                    if crate::clipboard::is_file_url_set_by_hdobbydesk(&urls) {
                         return;
                     }
                     if self.is_file_required() {
@@ -2167,6 +2124,12 @@ impl LoginConfigHandler {
                 }
             };
             if config.view_only.v {
+                if config.options.remove("collaborative-cursor").is_some() {
+                    option.collaborative_cursor = BoolOption::No.into();
+                }
+                if config.options.remove("keyboard-gamepad").is_some() {
+                    option.keyboard_gamepad = BoolOption::No.into();
+                }
                 option.disable_keyboard = f(true);
                 option.disable_clipboard = f(true);
                 option.show_remote_cursor = f(true);
@@ -2190,6 +2153,108 @@ impl LoginConfigHandler {
             } else {
                 BoolOption::No
             }
+            .into();
+            if config.show_my_cursor.v && config.options.remove("collaborative-cursor").is_some() {
+                option.collaborative_cursor = BoolOption::No.into();
+            }
+        } else if name == "collaborative-cursor" {
+            let enabled = config
+                .options
+                .get("collaborative-cursor")
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+            let enabled = !enabled;
+            if enabled {
+                config
+                    .options
+                    .insert("collaborative-cursor".to_owned(), "Y".to_owned());
+                if config.show_my_cursor.v {
+                    config.show_my_cursor.v = false;
+                    option.show_my_cursor = BoolOption::No.into();
+                }
+                if config.view_only.v {
+                    config.view_only.v = false;
+                    option.disable_keyboard = BoolOption::No.into();
+                    option.disable_clipboard = (if config.disable_clipboard.v {
+                        BoolOption::Yes
+                    } else {
+                        BoolOption::No
+                    })
+                    .into();
+                    option.show_remote_cursor = (if config.show_remote_cursor.v {
+                        BoolOption::Yes
+                    } else {
+                        BoolOption::No
+                    })
+                    .into();
+                    option.enable_file_transfer = (if config.enable_file_copy_paste.v {
+                        BoolOption::Yes
+                    } else {
+                        BoolOption::No
+                    })
+                    .into();
+                    option.lock_after_session_end = (if config.lock_after_session_end.v {
+                        BoolOption::Yes
+                    } else {
+                        BoolOption::No
+                    })
+                    .into();
+                }
+            } else {
+                config.options.remove("collaborative-cursor");
+            }
+            option.collaborative_cursor = (if enabled {
+                BoolOption::Yes
+            } else {
+                BoolOption::No
+            })
+            .into();
+        } else if name == "keyboard-gamepad" {
+            let enabled = !config
+                .options
+                .get("keyboard-gamepad")
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+            if enabled {
+                config
+                    .options
+                    .insert("keyboard-gamepad".to_owned(), "Y".to_owned());
+                if config.view_only.v {
+                    config.view_only.v = false;
+                    option.disable_keyboard = BoolOption::No.into();
+                    option.disable_clipboard = (if config.disable_clipboard.v {
+                        BoolOption::Yes
+                    } else {
+                        BoolOption::No
+                    })
+                    .into();
+                    option.show_remote_cursor = (if config.show_remote_cursor.v {
+                        BoolOption::Yes
+                    } else {
+                        BoolOption::No
+                    })
+                    .into();
+                    option.enable_file_transfer = (if config.enable_file_copy_paste.v {
+                        BoolOption::Yes
+                    } else {
+                        BoolOption::No
+                    })
+                    .into();
+                    option.lock_after_session_end = (if config.lock_after_session_end.v {
+                        BoolOption::Yes
+                    } else {
+                        BoolOption::No
+                    })
+                    .into();
+                }
+            } else {
+                config.options.remove("keyboard-gamepad");
+            }
+            option.keyboard_gamepad = (if enabled {
+                BoolOption::Yes
+            } else {
+                BoolOption::No
+            })
             .into();
         } else {
             let is_set = self
@@ -2285,6 +2350,12 @@ impl LoginConfigHandler {
         }
         if view_only && self.get_toggle_option("show-my-cursor") {
             msg.show_my_cursor = BoolOption::Yes.into();
+        }
+        if !view_only && self.get_toggle_option("collaborative-cursor") {
+            msg.collaborative_cursor = BoolOption::Yes.into();
+        }
+        if !view_only && self.get_toggle_option("keyboard-gamepad") {
+            msg.keyboard_gamepad = BoolOption::Yes.into();
         }
         if self.get_toggle_option("follow-remote-cursor") {
             msg.follow_remote_cursor = BoolOption::Yes.into();
@@ -2662,16 +2733,15 @@ impl LoginConfigHandler {
         };
         let mut avatar = get_builtin_option(keys::OPTION_AVATAR);
         if avatar.is_empty() {
-            avatar = serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option(
-                "user_info",
-            ))
-            .ok()
-            .and_then(|x| {
-                x.get("avatar")
-                    .and_then(|x| x.as_str())
-                    .map(|x| x.trim().to_owned())
-            })
-            .unwrap_or_default();
+            avatar =
+                serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option("user_info"))
+                    .ok()
+                    .and_then(|x| {
+                        x.get("avatar")
+                            .and_then(|x| x.as_str())
+                            .map(|x| x.trim().to_owned())
+                    })
+                    .unwrap_or_default();
         }
         avatar = resolve_avatar_url(avatar);
         let mut display_name = get_builtin_option(keys::OPTION_DISPLAY_NAME);
@@ -3452,11 +3522,7 @@ async fn consume_local_switch_sides_uuid(id: &str, uuid: &Uuid) -> bool {
         return false;
     }
     match conn.next_timeout(1000).await {
-        Ok(Some(crate::ipc::Data::SwitchSidesUuid(
-            returned_uuid,
-            returned_id,
-            Some(true),
-        ))) => {
+        Ok(Some(crate::ipc::Data::SwitchSidesUuid(returned_uuid, returned_id, Some(true)))) => {
             returned_uuid == uuid && returned_id == id
         }
         _ => false,
@@ -3758,7 +3824,12 @@ pub trait Interface: Send + Clone + 'static + Sized {
             log::info!("Restart remote device, suppress connection error: {err}");
             // Flutter treats this as a reconnect control event. The text is kept
             // for legacy UI and existing translation reuse.
-            self.msgbox("restarting", "Restarting remote device", "Connection in progress. Please wait.", "");
+            self.msgbox(
+                "restarting",
+                "Restarting remote device",
+                "Connection in progress. Please wait.",
+                "",
+            );
             return;
         }
 
@@ -4023,7 +4094,7 @@ async fn hc_connection_(
     mut rx: UnboundedReceiver<()>,
     token: String,
 ) -> ResultType<()> {
-    let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
+    let mut timer = crate::app_interval(interval(crate::TIMER_OUT));
     let mut last_recv_msg = Instant::now();
     let mut keep_alive = crate::DEFAULT_KEEP_ALIVE;
 

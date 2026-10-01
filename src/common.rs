@@ -53,7 +53,7 @@ pub enum GrabState {
 pub type NotifyMessageBox = fn(String, String, String, String) -> dyn Future<Output = ()>;
 
 // the executable name of the portable version
-pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
+pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "HDOBBYDESK_APPNAME";
 
 pub const PLATFORM_WINDOWS: &str = "Windows";
 pub const PLATFORM_LINUX: &str = "Linux";
@@ -581,6 +581,9 @@ impl Drop for CheckTestNatType {
 }
 
 pub fn test_nat_type() {
+    if Config::get_rendezvous_server().is_empty() {
+        return;
+    }
     test_ipv6_sync();
     use std::sync::atomic::{AtomicBool, Ordering};
     std::thread::spawn(move || {
@@ -601,6 +604,9 @@ pub fn test_nat_type() {
 
         let mut i = 0;
         loop {
+            if Config::get_rendezvous_server().is_empty() {
+                break;
+            }
             match test_nat_type_() {
                 Ok(true) => break,
                 Err(err) => {
@@ -627,6 +633,9 @@ async fn test_nat_type_() -> ResultType<bool> {
     log::info!("Testing nat ...");
     let start = std::time::Instant::now();
     let server1 = Config::get_rendezvous_server();
+    if server1.is_empty() {
+        return Ok(true);
+    }
     let server2 = crate::increase_port(&server1, -1);
     let mut msg_out = RendezvousMessage::new();
     let serial = Config::get_serial();
@@ -693,6 +702,16 @@ pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>, boo
         if !lic.host.is_empty() {
             a = lic.host;
         }
+    }
+    // Older running services may still return an upstream or cached endpoint.
+    let configured = Config::get_rendezvous_servers();
+    b.retain(|server| configured.iter().any(|allowed| {
+        hbb_common::private_network::relay_allowed(server, allowed, RENDEZVOUS_PORT as u16)
+    }));
+    if !configured.iter().any(|allowed| {
+        hbb_common::private_network::relay_allowed(&a, allowed, RENDEZVOUS_PORT as u16)
+    }) {
+        a.clear();
     }
     let mut b: Vec<String> = b
         .drain(..)
@@ -938,75 +957,16 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
     }
 }
 
-pub fn check_software_update() {
-    if is_custom_client() {
-        return;
-    }
-    let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
-    if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
-        std::thread::spawn(move || allow_err!(do_check_software_update()));
-    }
-}
+// This private build has no automatic update service. Install reviewed releases manually.
+pub fn check_software_update() {}
 
-// No need to check `danger_accept_invalid_cert` for now.
-// Because the url is always `https://api.rustdesk.com/version/latest`.
-#[tokio::main(flavor = "current_thread")]
-pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
-    let (request, url) =
-        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
-    let proxy_conf = Config::get_socks();
-    let tls_url = get_url_for_tls(&url, &proxy_conf);
-    let tls_type = get_cached_tls_type(tls_url);
-    let is_tls_not_cached = tls_type.is_none();
-    let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let client = create_http_client_async(tls_type, false);
-    let latest_release_response = match client.post(&url).json(&request).send().await {
-        Ok(resp) => {
-            upsert_tls_cache(tls_url, tls_type, false);
-            resp
-        }
-        Err(err) => {
-            if is_tls_not_cached && err.is_request() {
-                let tls_type = TlsType::NativeTls;
-                let client = create_http_client_async(tls_type, false);
-                let resp = client.post(&url).json(&request).send().await?;
-                upsert_tls_cache(tls_url, tls_type, false);
-                resp
-            } else {
-                return Err(err.into());
-            }
-        }
-    };
-    let bytes = latest_release_response.bytes().await?;
-    let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
-    let response_url = resp.url;
-    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
-
-    if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
-        #[cfg(feature = "flutter")]
-        {
-            let mut m = HashMap::new();
-            m.insert("name", "check_software_update_finish");
-            m.insert("url", &response_url);
-            if let Ok(data) = serde_json::to_string(&m) {
-                let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
-            }
-        }
-        *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url;
-    } else {
-        *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
-    }
-    Ok(())
+pub fn do_check_software_update() -> hbb_common::ResultType<()> {
+    bail!("Automatic update services are disabled in this build")
 }
 
 #[inline]
 pub fn get_app_name() -> String {
     hbb_common::config::APP_NAME.read().unwrap().clone()
-}
-
-#[inline]
-pub fn is_rustdesk() -> bool {
-    hbb_common::config::APP_NAME.read().unwrap().eq("RustDesk")
 }
 
 #[inline]
@@ -1048,7 +1008,9 @@ pub fn get_api_server(api: String, custom: String) -> String {
     if Config::no_register_device() {
         return "".to_owned();
     }
-    let mut res = get_api_server_(api, custom);
+    let Some(mut res) = hbb_common::private_network::explicit_endpoint(&get_api_server_(api, custom)) else {
+        return String::new();
+    };
     if res.ends_with('/') {
         res.pop();
     }
@@ -1061,26 +1023,20 @@ pub fn get_api_server(api: String, custom: String) -> String {
     res
 }
 
-fn get_api_server_(api: String, custom: String) -> String {
+fn get_api_server_(api: String, _custom: String) -> String {
     #[cfg(windows)]
     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
         if !lic.api.is_empty() {
             return lic.api.clone();
         }
     }
-    if !api.is_empty() {
-        return api.to_owned();
-    }
-    let s0 = get_custom_rendezvous_server(custom);
-    if !s0.is_empty() {
-        let s = crate::increase_port(&s0, -2);
-        if s == s0 {
-            return format!("http://{}:{}", s, config::RENDEZVOUS_PORT - 2);
-        } else {
-            return format!("http://{}", s);
-        }
-    }
-    "https://admin.rustdesk.com".to_owned()
+    api
+}
+
+pub fn configured_relay_allowed(advertised: &str) -> bool {
+    hbb_common::private_network::relay_allowed(
+        advertised, &Config::get_option("relay-server"), config::RELAY_PORT as u16,
+    )
 }
 
 #[inline]
@@ -1922,7 +1878,7 @@ pub fn check_process(arg: &str, mut same_uid: bool) -> bool {
         if same_uid && p.user_id() != my_uid {
             continue;
         }
-        // on mac, p.cmd() get "/Applications/RustDesk.app/Contents/MacOS/RustDesk", "XPC_SERVICE_NAME=com.carriez.RustDesk_server"
+        // on mac, p.cmd() get "/Applications/HdobbyDesk.app/Contents/MacOS/HdobbyDesk", "XPC_SERVICE_NAME=com.carriez.HdobbyDesk_server"
         let parg = if p.cmd().len() <= 1 { "" } else { &p.cmd()[1] };
         if arg.is_empty() {
             if !parg.starts_with("--") {
@@ -2031,7 +1987,8 @@ pub fn create_symmetric_key_msg(their_pk_b: [u8; 32]) -> (Bytes, Bytes, secretbo
 
 #[inline]
 pub fn using_public_server() -> bool {
-    crate::get_custom_rendezvous_server(get_option("custom-rendezvous-server")).is_empty()
+    // An empty configuration means no ID service in this private build.
+    false
 }
 
 pub struct ThrottledInterval {
@@ -2073,10 +2030,10 @@ impl ThrottledInterval {
     }
 }
 
-pub type RustDeskInterval = ThrottledInterval;
+pub type AppInterval = ThrottledInterval;
 
 #[inline]
-pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
+pub fn app_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
@@ -2281,7 +2238,7 @@ pub fn get_builtin_option(key: &str) -> String {
 
 #[inline]
 pub fn is_custom_client() -> bool {
-    get_app_name() != "RustDesk"
+    get_app_name() != "HdobbyDesk"
 }
 
 pub fn verify_login(_raw: &str, _id: &str) -> bool {
@@ -2365,23 +2322,20 @@ async fn stun_ipv4_test(stun_server: &str) -> ResultType<(SocketAddr, String)> {
     })
 }
 
-static STUNS_V4: [&str; 3] = [
-    "stun.l.google.com:19302",
-    "stun.cloudflare.com:3478",
-    "stun.nextcloud.com:3478",
-];
-
-static STUNS_V6: [&str; 3] = [
-    "stun.l.google.com:19302",
-    "stun.cloudflare.com:3478",
-    "stun.nextcloud.com:3478",
-];
+// Optional STUN is supplied explicitly; no third-party discovery service is built in.
+fn configured_stun_servers() -> Vec<String> {
+    hbb_common::private_network::rendezvous_endpoint(&[
+        Config::get_option("custom-stun-server"),
+    ]).into_iter().collect()
+}
 
 pub async fn test_nat_ipv4() -> ResultType<(SocketAddr, String)> {
     use hbb_common::futures::future::{select_ok, FutureExt};
-    let tests = STUNS_V4
+    let servers = configured_stun_servers();
+    if servers.is_empty() { bail!("No STUN server configured"); }
+    let tests = servers
         .iter()
-        .map(|&stun| stun_ipv4_test(stun).boxed())
+        .map(|stun| stun_ipv4_test(stun).boxed())
         .collect::<Vec<_>>();
 
     match select_ok(tests).await {
@@ -2390,7 +2344,7 @@ pub async fn test_nat_ipv4() -> ResultType<(SocketAddr, String)> {
         }
         Err(e) => {
             bail!(
-                "Failed to get public IPv4 address via public STUN servers: {}",
+                "Failed to get public IPv4 address via the configured STUN server: {}",
                 e
             );
         }
@@ -2398,16 +2352,18 @@ pub async fn test_nat_ipv4() -> ResultType<(SocketAddr, String)> {
 }
 
 async fn test_bind_ipv6() -> ResultType<SocketAddr> {
+    let servers = configured_stun_servers();
+    let stun = servers.first().ok_or_else(|| anyhow!("No STUN server configured"))?;
     let local_addr = SocketAddr::from(([0u16; 8], 0)); // [::]:0
     let socket = UdpSocket::bind(local_addr).await?;
-    let addr = STUNS_V6[0]
+    let addr = stun
         .to_socket_addrs()?
         .filter(|x| x.is_ipv6())
         .next()
         .ok_or_else(|| {
             anyhow!(
                 "Failed to resolve STUN ipv6 server address: {}",
-                STUNS_V6[0]
+                stun
             )
         })?;
     socket.connect(addr).await?;
@@ -2415,6 +2371,10 @@ async fn test_bind_ipv6() -> ResultType<SocketAddr> {
 }
 
 pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
+    if configured_stun_servers().is_empty() {
+        PUBLIC_IPV6_ADDR.lock().unwrap().0 = None;
+        return None;
+    }
     if PUBLIC_IPV6_ADDR
         .lock()
         .unwrap()
@@ -2476,9 +2436,11 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
 
     Some(tokio::spawn(async {
         use hbb_common::futures::future::{select_ok, FutureExt};
-        let tests = STUNS_V6
+        let servers = configured_stun_servers();
+        if servers.is_empty() { return; }
+        let tests = servers
             .iter()
-            .map(|&stun| stun_ipv6_test(stun).boxed())
+            .map(|stun| stun_ipv6_test(stun).boxed())
             .collect::<Vec<_>>();
 
         match select_ok(tests).await {
@@ -2656,12 +2618,12 @@ mod tests {
     // ThrottledInterval tick at the same time as tokio interval, if no sleeps
     #[allow(non_snake_case)]
     #[tokio::test]
-    async fn test_RustDesk_interval() {
+    async fn test_app_interval() {
         let base_intervals = [interval_maker, interval_at_maker];
         for maker in base_intervals.into_iter() {
             let mut tokio_timer = maker();
             let mut tokio_times = Vec::new();
-            let mut timer = rustdesk_interval(maker());
+            let mut timer = app_interval(maker());
             let mut times = Vec::new();
             loop {
                 tokio::select! {
@@ -2705,10 +2667,10 @@ mod tests {
     // ThrottledInterval tick less times than tokio interval, if there're sleeps
     #[allow(non_snake_case)]
     #[tokio::test]
-    async fn test_RustDesk_interval_sleep() {
+    async fn test_app_interval_sleep() {
         let base_intervals = [interval_maker, interval_at_maker];
         for (i, maker) in base_intervals.into_iter().enumerate() {
-            let mut timer = rustdesk_interval(maker());
+            let mut timer = app_interval(maker());
             let mut times = Vec::new();
             sleep(Duration::from_secs(3)).await;
             loop {
@@ -2770,13 +2732,13 @@ mod tests {
         assert!(is_public("https://rustdesk.com/"));
         assert!(is_public("https://www.rustdesk.com/"));
         assert!(is_public("https://api.rustdesk.com/v1"));
-        assert!(is_public("https://API.RUSTDESK.COM/v1"));
+        assert!(is_public("https://API.HDOBBYDESK.COM/v1"));
         assert!(is_public("https://rustdesk.com/path"));
 
         // Test URLs ending with "rustdesk.com"
         assert!(is_public("rustdesk.com"));
         assert!(is_public("https://rustdesk.com"));
-        assert!(is_public("https://RustDesk.com"));
+        assert!(is_public("https://HdobbyDesk.com"));
         assert!(is_public("http://www.rustdesk.com"));
         assert!(is_public("https://api.rustdesk.com"));
 
@@ -2785,8 +2747,8 @@ mod tests {
         assert!(!is_public("https://custom-server.com"));
         assert!(!is_public("http://192.168.1.1"));
         assert!(!is_public("localhost"));
-        assert!(!is_public("https://rustdesk.computer.com"));
-        assert!(!is_public("rustdesk.comhello.com"));
+        assert!(!is_public("https://hdobbydesk.computer.com"));
+        assert!(!is_public("hdobbydesk.comhello.com"));
     }
 
     #[test]

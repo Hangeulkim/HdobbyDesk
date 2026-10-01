@@ -44,7 +44,6 @@ const FRAME_ALIGN: usize = 64;
 const ADDR_IPC_TOKEN: usize = 0;
 const ADDR_CURSOR_PARA: usize = ADDR_IPC_TOKEN + IPC_TOKEN_LEN;
 const ADDR_CURSOR_COUNTER: usize = ADDR_CURSOR_PARA + size_of::<CURSORINFO>();
-
 const ADDR_CAPTURER_PARA: usize = ADDR_CURSOR_COUNTER + SIZE_COUNTER;
 const ADDR_CAPTURE_FRAME_INFO: usize = ADDR_CAPTURER_PARA + size_of::<CapturerPara>();
 const ADDR_CAPTURE_WOULDBLOCK: usize = ADDR_CAPTURE_FRAME_INFO + size_of::<FrameInfo>();
@@ -52,6 +51,10 @@ const ADDR_CAPTURE_FRAME_COUNTER: usize = ADDR_CAPTURE_WOULDBLOCK + size_of::<i3
 
 const ADDR_CAPTURE_FRAME: usize =
     (ADDR_CAPTURE_FRAME_COUNTER + SIZE_COUNTER + FRAME_ALIGN - 1) / FRAME_ALIGN * FRAME_ALIGN;
+// Keep the established capture offsets unchanged: a session helper can outlive
+// the service during an in-place update. The focus flag fits in unused padding.
+const ADDR_CURSOR_TEXT_FOCUSED: usize = ADDR_CAPTURE_FRAME_COUNTER + SIZE_COUNTER;
+const _: () = assert!(ADDR_CURSOR_TEXT_FOCUSED + size_of::<u32>() <= ADDR_CAPTURE_FRAME);
 const MIN_RUNTIME_SHMEM_LEN: usize = ADDR_CAPTURE_FRAME + FRAME_ALIGN;
 
 const IPC_SUFFIX: &str = "_portable_service";
@@ -570,6 +573,10 @@ pub mod server {
                 (*para).cbSize = size_of::<CURSORINFO>() as _;
                 let result = winuser::GetCursorInfo(para);
                 if result == TRUE {
+                    let focused = crate::platform::windows::is_text_input_focused_local() as u32;
+                    (*(shmem.as_ptr().add(ADDR_CURSOR_TEXT_FOCUSED)
+                        as *const std::sync::atomic::AtomicU32))
+                        .store(focused, Ordering::Release);
                     utils::increase_counter(shmem.as_ptr().add(ADDR_CURSOR_COUNTER));
                 }
             }
@@ -740,7 +747,7 @@ pub mod server {
                     return;
                 }
                 let mut timer =
-                    crate::rustdesk_interval(tokio::time::interval(Duration::from_secs(1)));
+                    crate::app_interval(tokio::time::interval(Duration::from_secs(1)));
                 let mut nack = 0;
                 loop {
                     if *EXIT.lock().unwrap() {
@@ -1381,7 +1388,7 @@ pub mod client {
                                     tokio::spawn(async move {
                                         let mut stream = stream;
                                         let postfix = postfix.to_owned();
-                                        let mut timer = crate::rustdesk_interval(tokio::time::interval(Duration::from_secs(1)));
+                                        let mut timer = crate::app_interval(tokio::time::interval(Duration::from_secs(1)));
                                         let mut nack = 0;
                                         let mut rx = rx_clone.lock().await;
                                         loop {
@@ -1536,6 +1543,20 @@ pub mod client {
                 .map_or(FALSE, |sheme| get_cursor_info_(sheme, pci))
         } else {
             unsafe { winuser::GetCursorInfo(pci) }
+        }
+    }
+
+    pub fn is_text_input_focused() -> bool {
+        if *RUNNING.lock().unwrap() {
+            let shmem = SHMEM.lock().unwrap();
+            shmem.as_ref().map_or(false, |shmem| unsafe {
+                (*(shmem.as_ptr().add(ADDR_CURSOR_TEXT_FOCUSED)
+                    as *const std::sync::atomic::AtomicU32))
+                    .load(Ordering::Acquire)
+                    != 0
+            })
+        } else {
+            crate::platform::windows::is_text_input_focused_local()
         }
     }
 

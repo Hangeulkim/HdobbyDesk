@@ -35,6 +35,8 @@ pub type SessionID = uuid::Uuid;
 
 lazy_static::lazy_static! {
     static ref TEXTURE_RENDER_KEY: Arc<AtomicI32> = Arc::new(AtomicI32::new(0));
+    static ref DIRECT_TLS_PREPARATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ref DIRECT_TLS_PAIRING_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 fn initialize(app_dir: &str, custom_client_config: &str) {
@@ -206,6 +208,31 @@ pub fn session_get_remember(session_id: SessionID) -> Option<bool> {
     } else {
         None
     }
+}
+
+pub fn session_send_ios_clipboard(
+    session_id: SessionID,
+    text: String,
+    png: Vec<u8>,
+) -> SyncReturn<String> {
+    SyncReturn(
+        flutter::send_ios_clipboard(&session_id, text, png)
+            .err()
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+pub fn session_get_ios_clipboard_text(token: String) -> SyncReturn<String> {
+    SyncReturn(flutter::get_ios_clipboard_text(&token))
+}
+
+pub fn session_get_ios_clipboard_png(token: String) -> SyncReturn<Vec<u8>> {
+    SyncReturn(flutter::get_ios_clipboard_png(&token))
+}
+
+pub fn session_clear_ios_clipboard(token: String) {
+    flutter::clear_ios_clipboard_payload(&token);
 }
 
 pub fn session_get_toggle_option(session_id: SessionID, arg: String) -> Option<bool> {
@@ -1367,6 +1394,89 @@ pub fn main_get_uuid() -> String {
 
 pub fn main_get_peer_option(id: String, key: String) -> String {
     get_peer_option(id, key)
+}
+
+/// Called on the normal FRB worker. Creates local host identity only after an explicit UI action.
+pub fn main_prepare_direct_tls_identity() -> hbb_common::anyhow::Result<String> {
+    #[cfg(target_os = "ios")]
+    hbb_common::bail!("iPhone supports controlling another host only");
+    #[cfg(not(target_os = "ios"))]
+    {
+        #[cfg(target_os = "windows")]
+        {
+            use hbb_common::anyhow::Context;
+            let code = crate::ipc::get_service_config("direct-tls-pairing-code")?
+                .context("The Windows host service could not prepare its persistent certificate")?;
+            hbb_common::direct_tls::PeerTrust::from_pairing_code(&code)?;
+            return Ok(code);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            use hbb_common::{
+                config::Config,
+                direct_tls::{Identity, IDENTITY_FILE_OPTION},
+            };
+            let _guard = DIRECT_TLS_PREPARATION.lock().unwrap();
+            if config::is_outgoing_only() {
+                hbb_common::bail!("This client is configured for outgoing connections only");
+            }
+            let selected = get_option(IDENTITY_FILE_OPTION);
+            let path = if selected.is_empty() {
+                Config::path("hdobby-direct-tls-identity.json")
+            } else {
+                PathBuf::from(selected)
+            };
+            if !path.is_absolute() {
+                hbb_common::bail!("Private application storage is unavailable");
+            }
+            // No private material is passed through the bridge or option/IPC map.
+            let identity = Identity::load_or_create(&path)?;
+            set_option(
+                IDENTITY_FILE_OPTION.to_owned(),
+                path.to_string_lossy().into_owned(),
+            );
+            let stored: hbb_common::toml::Value = hbb_common::toml::from_str(
+                &std::fs::read_to_string(config::Config2::file())?,
+            )?;
+            if stored
+                .get("options")
+                .and_then(|v| v.get(IDENTITY_FILE_OPTION))
+                .and_then(|v| v.as_str())
+                != path.to_str()
+            {
+                hbb_common::bail!("Certificate created, but its local setting could not be saved");
+            }
+            Ok(identity.pairing_code())
+        }
+    }
+}
+
+pub fn main_inspect_direct_tls_pairing(code: String) -> hbb_common::anyhow::Result<String> {
+    Ok(hbb_common::direct_tls::PeerTrust::from_pairing_code(&code)?.fingerprint())
+}
+
+pub fn main_get_direct_tls_pairing(peer: String) -> hbb_common::anyhow::Result<String> {
+    hbb_common::direct_tls::endpoint(&peer)?;
+    Ok(get_peer_option(peer, hbb_common::direct_tls::PEER_CERT_OPTION.to_owned()))
+}
+
+/// The caller must show the old and new fingerprint before deliberately replacing trust.
+pub fn main_save_direct_tls_pairing(peer: String, code: String, previous: String) -> hbb_common::anyhow::Result<String> {
+    let _guard = DIRECT_TLS_PAIRING_WRITE.lock().unwrap();
+    use hbb_common::direct_tls::{self, PeerTrust, PEER_CERT_OPTION};
+    direct_tls::endpoint(&peer)?;
+    let code = code.trim();
+    let trust = PeerTrust::from_pairing_code(code)?;
+    let mut config = PeerConfig::load(&peer);
+    if config.options.get(PEER_CERT_OPTION).map(String::as_str).unwrap_or_default() != previous {
+        hbb_common::bail!("Pairing changed in another window; reopen and review it again");
+    }
+    config.options.insert(PEER_CERT_OPTION.to_owned(), code.to_owned());
+    config.store(&peer);
+    if PeerConfig::load(&peer).options.get(PEER_CERT_OPTION).map(String::as_str) != Some(code) {
+        hbb_common::bail!("Could not save the paired certificate");
+    }
+    Ok(trust.fingerprint())
 }
 
 pub fn main_get_peer_option_sync(id: String, key: String) -> SyncReturn<String> {
@@ -2861,12 +2971,12 @@ pub fn main_get_common(key: String) -> String {
                 crate::common::is_custom_client(),
             ) {
                 (Ok(true), false) => match crate::platform::windows::release_arch_suffix() {
-                    Some(arch) => format!("rustdesk-{_version}-{arch}.msi"),
+                    Some(arch) => format!("hdobbydesk-{_version}-{arch}.msi"),
                     None => "error:unsupported".to_owned(),
                 },
                 (Ok(true), true) | (Ok(false), _) => {
                     match crate::platform::windows::release_arch_suffix() {
-                        Some(arch) => format!("rustdesk-{_version}-{arch}.exe"),
+                        Some(arch) => format!("hdobbydesk-{_version}-{arch}.exe"),
                         None => "error:unsupported".to_owned(),
                     }
                 }
@@ -2878,9 +2988,9 @@ pub fn main_get_common(key: String) -> String {
             #[cfg(target_os = "macos")]
             {
                 return if cfg!(target_arch = "x86_64") {
-                    format!("rustdesk-{_version}-x86_64.dmg")
+                    format!("hdobbydesk-{_version}-x86_64.dmg")
                 } else if cfg!(target_arch = "aarch64") {
-                    format!("rustdesk-{_version}-aarch64.dmg")
+                    format!("hdobbydesk-{_version}-aarch64.dmg")
                 } else {
                     "error:unsupported".to_owned()
                 };

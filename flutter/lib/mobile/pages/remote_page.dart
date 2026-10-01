@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'package:flutter_hbb/hdobby/input_helper.dart';
+import 'package:hdobby_input/hdobby_input.dart' show SoftKeyboardEdit;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -66,6 +68,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Orientation? _currentOrientation;
   final _uniqueKey = UniqueKey();
   Timer? _iosKeyboardWorkaroundTimer;
+  Timer? _autoKeyboardTimer;
+  bool _wasBackgrounded = false;
 
   final _blockableOverlayState = BlockableOverlayState();
 
@@ -115,6 +119,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         .changeCurrentKey(MessageKey(widget.id, ChatModel.clientModeID));
     _blockableOverlayState.applyFfi(gFFI);
     gFFI.imageModel.addCallbackOnFirstImage((String peerId) {
+      if (isAndroid) {
+        unawaited(_matchRemoteOrientation());
+      }
       gFFI.recordingModel
           .updateStatus(bind.sessionGetIsRecording(sessionId: gFFI.sessionId));
       if (gFFI.recordingModel.start) {
@@ -126,6 +133,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
 
     inputModel.keyboardInputAllowed = true;
+    if (isAndroid) inputModel.onLeftClick = _maybeOpenKeyboardForTextInput;
 
     // Wayland sessions may use clipboard-based text input on the controlled side.
     // Require explicit user confirmation before allowing soft-keyboard and
@@ -138,6 +146,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     if (gFFI.ffiModel.pi.isSet.value) {
       _initWaylandKeyboardGateIfNeeded();
     }
+  }
+
+  Future<void> _matchRemoteOrientation() async {
+    final display = gFFI.ffiModel.pi.tryGetDisplayIfNotAllDisplay();
+    if (display == null || display.width == display.height) return;
+    await SystemChrome.setPreferredOrientations(display.width > display.height
+        ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]
+        : [DeviceOrientation.portraitUp, DeviceOrientation.portraitDown]);
   }
 
   @override
@@ -155,6 +171,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     super.dispose();
     gFFI.dialogManager.hideMobileActionsOverlay(store: false);
     gFFI.inputModel.listenToMouse(false);
+    inputModel.onLeftClick = null;
     gFFI.imageModel.disposeImage();
     gFFI.cursorModel.disposeImages();
     await gFFI.invokeMethod("enable_soft_keyboard", true);
@@ -166,9 +183,13 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     await gFFI.close();
     _timer?.cancel();
     _iosKeyboardWorkaroundTimer?.cancel();
+    _autoKeyboardTimer?.cancel();
     gFFI.dialogManager.dismissAll();
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
         overlays: SystemUiOverlay.values);
+    if (isAndroid) {
+      await SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    }
     WakelockManager.disable(_uniqueKey);
     await keyboardSubscription.cancel();
     removeSharedStates(widget.id);
@@ -182,6 +203,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       trySyncClipboard();
+      if (_wasBackgrounded) {
+        _wasBackgrounded = false;
+        gFFI.ffiModel.resumePendingReconnect(gFFI.dialogManager, sessionId);
+      }
+    } else if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      _wasBackgrounded = true;
     }
   }
 
@@ -325,6 +354,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _softKeyboardQueue = Future<void>.value();
+  int _softKeyboardGeneration = 0;
+
   void _handleNonIOSSoftKeyboardInput(String newValue) {
     var oldValue = _value;
     _value = newValue;
@@ -332,38 +364,62 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         newValue.isNotEmpty &&
         oldValue[0] == '1' &&
         newValue[0] != '1') {
-      // clipboard
+      // A paste can replace the local backspace sentinel, which was never sent.
       oldValue = '';
     }
-    if (newValue.length == oldValue.length) {
-      // ?
-    } else if (newValue.length < oldValue.length) {
-      final char = 'VK_BACK';
-      inputModel.inputKey(char);
-    } else {
-      final content = newValue.substring(oldValue.length);
-      if (content.length > 1) {
-        if (oldValue != '' &&
-            content.length == 2 &&
-            (content == '""' ||
-                content == '()' ||
-                content == '[]' ||
-                content == '<>' ||
-                content == "{}" ||
-                content == '”“' ||
-                content == '《》' ||
-                content == '（）' ||
-                content == '【】')) {
-          // can not only input content[0], because when input ], [ are also auo insert, which cause ] never be input
-          bind.sessionInputString(sessionId: sessionId, value: content);
-          _openKeyboardUnlocked();
-          return;
-        }
-        bind.sessionInputString(sessionId: sessionId, value: content);
-      } else {
-        inputChar(content);
+    final edit = SoftKeyboardEdit.between(oldValue, newValue);
+    final generation = _softKeyboardGeneration;
+    final targetSessionId = sessionId;
+    final alt = inputModel.alt;
+    final ctrl = inputModel.ctrl;
+    final shift = inputModel.shift;
+    final command = inputModel.command;
+    bool ready() =>
+        mounted &&
+        generation == _softKeyboardGeneration &&
+        gFFI.sessionId == targetSessionId &&
+        !gFFI.closed &&
+        inputModel.keyboardInputAllowed &&
+        inputModel.keyboardPerm &&
+        !inputModel.isViewCamera;
+    Future<void> key(String name) => bind.sessionInputKey(
+        sessionId: targetSessionId,
+        name: name,
+        down: false,
+        press: true,
+        alt: alt,
+        ctrl: ctrl,
+        shift: shift,
+        command: command);
+    // Serialize replacements across asynchronous FRB calls so a rapid IME
+    // update cannot insert its text before the preceding deletion finishes.
+    _softKeyboardQueue = _softKeyboardQueue.then((_) async {
+      if (!ready()) return;
+      for (var i = 0; i < edit.backspaces; i++) {
+        if (!ready()) return;
+        await key('VK_BACK');
       }
-    }
+      if (!ready() || edit.text.isEmpty) return;
+      if (edit.text == '\n' || edit.text == ' ') {
+        await key(edit.text == '\n' ? 'VK_RETURN' : 'VK_SPACE');
+      } else if (edit.text.length == 1 && (alt || ctrl || command)) {
+        await key(edit.text);
+      } else {
+        await bind.sessionInputString(
+            sessionId: targetSessionId, value: edit.text);
+      }
+      if (ready() &&
+          oldValue.isNotEmpty &&
+          edit.backspaces == 0 &&
+          const ['""', '()', '[]', '<>', '{}', '”“', '《》', '（）', '【】']
+              .contains(edit.text)) {
+        _openKeyboardUnlocked();
+      }
+    }).catchError((Object error, StackTrace stack) {
+      // Do not replay uncertain edits after a bridge failure.
+      if (generation == _softKeyboardGeneration) _softKeyboardGeneration++;
+      debugPrint('Soft keyboard input failed; reopen the keyboard to retry.');
+    });
   }
 
   // handle mobile virtual keyboard
@@ -412,7 +468,33 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _openKeyboardUnlocked();
   }
 
+  void _maybeOpenKeyboardForTextInput() {
+    if (gFFI.ffiModel.pi.platform != kPeerPlatformWindows) return;
+    _autoKeyboardTimer?.cancel();
+    _checkWindowsTextInputAfterClick(5);
+  }
+
+  void _checkWindowsTextInputAfterClick(int checksLeft) {
+    _autoKeyboardTimer = Timer(const Duration(milliseconds: 250), () {
+      if (!mounted ||
+          !inputModel.keyboardPerm ||
+          !inputModel.keyboardInputAllowed ||
+          _showEdit ||
+          keyboardVisibilityController.isVisible) {
+        return;
+      }
+      if (gFFI.cursorModel.isTextInputCursor) {
+        openKeyboard();
+      } else if (checksLeft > 1) {
+        // The Windows host reports focus after it processes the remote click.
+        // Allow for network and desktop-switch latency without polling forever.
+        _checkWindowsTextInputAfterClick(checksLeft - 1);
+      }
+    });
+  }
+
   void _openKeyboardUnlocked() {
+    _softKeyboardGeneration++;
     inputModel.keyboardInputAllowed = true;
     gFFI.invokeMethod("enable_soft_keyboard", true);
     // destroy first, so that our _value trick can work
@@ -559,82 +641,113 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         mainAxisSize: MainAxisSize.max,
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: <Widget>[
-          Row(
-              children: <Widget>[
-                    IconButton(
-                      color: Colors.white,
-                      icon: Icon(Icons.clear),
-                      onPressed: () {
-                        clientClose(sessionId, gFFI);
-                      },
-                    ),
-                    IconButton(
-                      color: Colors.white,
-                      icon: Icon(Icons.tv),
-                      onPressed: () {
-                        setState(() => _showEdit = false);
-                        showOptions(context, widget.id, gFFI.dialogManager);
-                      },
-                    )
-                  ] +
-                  (isWebDesktop || ffiModel.viewOnly || !ffiModel.keyboard
-                      ? []
-                      : gFFI.ffiModel.isPeerAndroid
-                          ? [
-                              IconButton(
-                                  color: Colors.white,
-                                  icon: Icon(Icons.keyboard),
-                                  onPressed: openKeyboard),
-                              IconButton(
-                                color: Colors.white,
-                                icon: const Icon(Icons.build),
-                                onPressed: () => gFFI.dialogManager
-                                    .toggleMobileActionsOverlay(ffi: gFFI),
-                              )
-                            ]
-                          : [
-                              IconButton(
-                                  color: Colors.white,
-                                  icon: Icon(Icons.keyboard),
-                                  onPressed: openKeyboard),
-                              IconButton(
-                                color: Colors.white,
-                                icon: Icon(gFFI.ffiModel.touchMode
-                                    ? Icons.touch_app
-                                    : Icons.mouse),
-                                onPressed: () => setState(
-                                    () => _showGestureHelp = !_showGestureHelp),
-                              ),
-                            ]) +
-                  (isWeb
-                      ? []
-                      : <Widget>[
-                          futureBuilder(
-                              future: gFFI.invokeMethod(
-                                  "get_value", "KEY_IS_SUPPORT_VOICE_CALL"),
-                              hasData: (isSupportVoiceCall) => IconButton(
+          Expanded(
+              child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                      children: <Widget>[
+                            IconButton(
+                              color: Colors.white,
+                              icon: Icon(Icons.clear),
+                              onPressed: () {
+                                clientClose(sessionId, gFFI);
+                              },
+                            ),
+                            IconButton(
+                              color: Colors.white,
+                              icon: Icon(Icons.tv),
+                              onPressed: () {
+                                setState(() => _showEdit = false);
+                                showOptions(
+                                    context, widget.id, gFFI.dialogManager);
+                              },
+                            ),
+                            windowsSessionScopeIndicator(context, gFFI),
+                          ] +
+                          (ffiModel.viewOnly || !ffiModel.keyboard
+                              ? <Widget>[]
+                              : [
+                                  IconButton(
+                                    tooltip: hdobbyInputHelperLabel(context),
                                     color: Colors.white,
-                                    icon: isAndroid && isSupportVoiceCall
-                                        ? SvgPicture.asset('assets/chat.svg',
-                                            colorFilter: ColorFilter.mode(
-                                                Colors.white, BlendMode.srcIn))
-                                        : Icon(Icons.message),
-                                    onPressed: () =>
-                                        isAndroid && isSupportVoiceCall
-                                            ? showChatOptions(widget.id)
-                                            : onPressedTextChat(widget.id),
-                                  ))
-                        ]) +
-                  [
-                    IconButton(
-                      color: Colors.white,
-                      icon: Icon(Icons.more_vert),
-                      onPressed: () {
-                        setState(() => _showEdit = false);
-                        showActions(widget.id);
-                      },
-                    ),
-                  ]),
+                                    icon: const Icon(Icons.edit_note),
+                                    onPressed: () async {
+                                      setState(() => _showEdit = false);
+                                      _physicalFocusNode.unfocus();
+                                      await showHdobbyInputHelper(
+                                          context, gFFI);
+                                      if (mounted)
+                                        _physicalFocusNode.requestFocus();
+                                    },
+                                  )
+                                ]) +
+                          (isWebDesktop ||
+                                  ffiModel.viewOnly ||
+                                  !ffiModel.keyboard
+                              ? []
+                              : gFFI.ffiModel.isPeerAndroid
+                                  ? [
+                                      IconButton(
+                                          color: Colors.white,
+                                          icon: Icon(Icons.keyboard),
+                                          onPressed: openKeyboard),
+                                      IconButton(
+                                        color: Colors.white,
+                                        icon: const Icon(Icons.build),
+                                        onPressed: () => gFFI.dialogManager
+                                            .toggleMobileActionsOverlay(
+                                                ffi: gFFI),
+                                      )
+                                    ]
+                                  : [
+                                      IconButton(
+                                          color: Colors.white,
+                                          icon: Icon(Icons.keyboard),
+                                          onPressed: openKeyboard),
+                                      IconButton(
+                                        color: Colors.white,
+                                        icon: Icon(gFFI.ffiModel.touchMode
+                                            ? Icons.touch_app
+                                            : Icons.mouse),
+                                        onPressed: () => setState(() =>
+                                            _showGestureHelp =
+                                                !_showGestureHelp),
+                                      ),
+                                    ]) +
+                          (isWeb
+                              ? []
+                              : <Widget>[
+                                  futureBuilder(
+                                      future: gFFI.invokeMethod("get_value",
+                                          "KEY_IS_SUPPORT_VOICE_CALL"),
+                                      hasData: (isSupportVoiceCall) =>
+                                          IconButton(
+                                            color: Colors.white,
+                                            icon: isAndroid &&
+                                                    isSupportVoiceCall
+                                                ? SvgPicture.asset(
+                                                    'assets/chat.svg',
+                                                    colorFilter:
+                                                        ColorFilter.mode(
+                                                            Colors.white,
+                                                            BlendMode.srcIn))
+                                                : Icon(Icons.message),
+                                            onPressed: () => isAndroid &&
+                                                    isSupportVoiceCall
+                                                ? showChatOptions(widget.id)
+                                                : onPressedTextChat(widget.id),
+                                          ))
+                                ]) +
+                          [
+                            IconButton(
+                              color: Colors.white,
+                              icon: Icon(Icons.more_vert),
+                              onPressed: () {
+                                setState(() => _showEdit = false);
+                                showActions(widget.id);
+                              },
+                            ),
+                          ]))),
           Obx(() => IconButton(
                 color: Colors.white,
                 icon: Icon(Icons.expand_more),

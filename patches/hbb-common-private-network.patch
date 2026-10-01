@@ -1,0 +1,1066 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 6ad3012..57b43f8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -50,0 +51 @@ base64 = "0.22"
++data-encoding = "2.9"
+@@ -52,0 +54 @@ sha2 = "0.10"
++rcgen = { version = "0.13.2", default-features = false, features = ["ring"] }
+diff --git a/examples/webrtc.rs b/examples/webrtc.rs
+index 2c993ca..b0aac96 100644
+--- a/examples/webrtc.rs
++++ b/examples/webrtc.rs
+@@ -6 +5,0 @@ use hbb_common::webrtc::WebRTCStream;
+-use std::io::Write;
+@@ -9,0 +9 @@ use clap::{Arg, Command};
++use std::io::Write;
+diff --git a/protos/message.proto b/protos/message.proto
+index 8b21368..cd6608a 100644
+--- a/protos/message.proto
++++ b/protos/message.proto
+@@ -199,0 +200,3 @@ message MouseEvent {
++  // The host may set this after resolving a collaborative presence cursor.
++  // Older clients leave it false and preserve positionless button semantics.
++  bool position_valid = 5;
+@@ -321,0 +325,2 @@ message CursorData {
++  // The standard Windows text insertion cursor; older peers omit this field.
++  bool text_input_cursor = 7;
+@@ -698,0 +704,6 @@ message OptionMessage {
++  // Presence cursor movement is rendered for every viewer. Only an acquired
++  // click/drag gesture moves the host system cursor.
++  BoolOption collaborative_cursor = 20;
++  // Convert this connection's physical keyboard events into one host-assigned
++  // XInput gamepad. The client never selects another connection's slot.
++  BoolOption keyboard_gamepad = 21;
+diff --git a/src/compress.rs b/src/compress.rs
+index 761d916..ebe48e7 100644
+--- a/src/compress.rs
++++ b/src/compress.rs
+@@ -34,0 +35,28 @@ pub fn decompress(data: &[u8]) -> Vec<u8> {
++
++/// Decode untrusted clipboard content with bounded output and decoder memory.
++/// Other consumers keep their existing size policies through `decompress`.
++pub fn decompress_limited(data: &[u8], max_output_size: usize) -> io::Result<Vec<u8>> {
++    use io::Read;
++
++    if data.is_empty() {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "Missing compressed frame",
++        ));
++    }
++    let read_limit = max_output_size.checked_add(1).ok_or_else(|| {
++        io::Error::new(io::ErrorKind::InvalidInput, "Decompression limit overflow")
++    })?;
++    let mut decoder = zstd::stream::read::Decoder::new(data)?;
++    // Reject a frame requesting a history window larger than 64 MiB.
++    decoder.window_log_max(26)?;
++    let mut output = Vec::new();
++    decoder.take(read_limit as u64).read_to_end(&mut output)?;
++    if output.len() > max_output_size {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "Decompressed clipboard exceeds the size limit",
++        ));
++    }
++    Ok(output)
++}
+diff --git a/src/config.rs b/src/config.rs
+index 1391ed4..2a7ad72 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -34,0 +35,2 @@ use permanent_password::{
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++use crate::view_style::migrate_legacy_desktop_view_style;
+@@ -57 +59 @@ lazy_static::lazy_static! {
+-    pub static ref ORG: RwLock<String> = RwLock::new("com.carriez".to_owned());
++    pub static ref ORG: RwLock<String> = RwLock::new("com.hdobby".to_owned());
+@@ -72 +74 @@ lazy_static::lazy_static! {
+-    pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());
++    pub static ref APP_NAME: RwLock<String> = RwLock::new("HdobbyDesk".to_owned());
+@@ -120,2 +122,2 @@ const CHARS: &[char] = &[
+-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
+-pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
++pub const RENDEZVOUS_SERVERS: &[&str] = &[];
++pub const RS_PUB_KEY: &str = "";
+@@ -914,20 +916,5 @@ impl Config {
+-        let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+-        if rendezvous_server.is_empty() {
+-            rendezvous_server = Self::get_option("custom-rendezvous-server");
+-        }
+-        if rendezvous_server.is_empty() {
+-            rendezvous_server = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+-        }
+-        if rendezvous_server.is_empty() {
+-            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();
+-        }
+-        if rendezvous_server.is_empty() {
+-            rendezvous_server = Self::get_rendezvous_servers()
+-                .drain(..)
+-                .next()
+-                .unwrap_or_default();
+-        }
+-        if !rendezvous_server.contains(':') {
+-            rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
+-        }
+-        rendezvous_server
++        Self::get_rendezvous_servers()
++            .into_iter()
++            .next()
++            .map(|server| crate::socket_client::check_port(server, RENDEZVOUS_PORT))
++            .unwrap_or_default()
+@@ -937,24 +924,8 @@ impl Config {
+-        let s = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+-        if !s.is_empty() {
+-            return vec![s];
+-        }
+-        let s = Self::get_option("custom-rendezvous-server");
+-        if !s.is_empty() {
+-            return vec![s];
+-        }
+-        let s = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+-        if !s.is_empty() {
+-            return vec![s];
+-        }
+-        let serial_obsolute = CONFIG2.read().unwrap().serial > SERIAL;
+-        if serial_obsolute {
+-            let ss: Vec<String> = Self::get_option("rendezvous-servers")
+-                .split(',')
+-                .filter(|x| x.contains('.'))
+-                .map(|x| x.to_owned())
+-                .collect();
+-            if !ss.is_empty() {
+-                return ss;
+-            }
+-        }
+-        return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect();
++        // Cached responses and upstream defaults must never select a service.
++        crate::private_network::rendezvous_endpoint(&[
++            EXE_RENDEZVOUS_SERVER.read().unwrap().clone(),
++            Self::get_option("custom-rendezvous-server"),
++            PROD_RENDEZVOUS_SERVER.read().unwrap().clone(),
++        ])
++        .into_iter()
++        .collect()
+@@ -1704,0 +1676,5 @@ impl PeerConfig {
++    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++    fn migrate_adaptive_view_style(&mut self) -> bool {
++        migrate_legacy_desktop_view_style(&mut self.view_style, &mut self.ui_flutter)
++    }
++
+@@ -1722,0 +1699,4 @@ impl PeerConfig {
++                #[cfg(not(any(target_os = "android", target_os = "ios")))]
++                {
++                    store = config.migrate_adaptive_view_style() || store;
++                }
+@@ -1918 +1898 @@ impl PeerConfig {
+-            .map(|(id, t, p)| {
++            .map(|(id, t, _)| {
+@@ -1920,3 +1900,3 @@ impl PeerConfig {
+-                if c.info.platform.is_empty() {
+-                    fs::remove_file(p).ok();
+-                }
++                // Pairing and preferences can be saved before the first connection.
++                // An empty platform hides the entry from history; it does not make
++                // the user's settings disposable. Removal must stay explicit.
+@@ -2368 +2348 @@ impl UserDefaultConfig {
+-            keys::OPTION_VIEW_STYLE => self.get_string(key, "original", vec!["adaptive"]),
++            keys::OPTION_VIEW_STYLE => self.get_string(key, "adaptive", vec!["original"]),
+@@ -3932,0 +3913,23 @@ mod tests {
++    #[test]
++    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++    fn test_legacy_desktop_view_style_migrates_once_without_touching_resolution() {
++        let mut config = PeerConfig::default();
++        config.view_style = "original".to_owned();
++        config
++            .ui_flutter
++            .remove(crate::view_style::HDOBBY_ADAPTIVE_VIEW_MIGRATION);
++        config.custom_resolutions =
++            HashMap::from([("0".to_owned(), Resolution { w: 1920, h: 1080 })]);
++
++        assert!(config.migrate_adaptive_view_style());
++        assert_eq!(config.view_style, "adaptive");
++        assert_eq!(
++            config.custom_resolutions.get("0"),
++            Some(&Resolution { w: 1920, h: 1080 })
++        );
++
++        config.view_style = "original".to_owned();
++        assert!(!config.migrate_adaptive_view_style());
++        assert_eq!(config.view_style, "original");
++    }
++
+diff --git a/src/lib.rs b/src/lib.rs
+index 2b35642..7a42348 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -31,0 +32 @@ pub mod mem;
++pub mod private_network;
+@@ -59,0 +61 @@ pub use flexi_logger;
++pub mod direct_tls;
+@@ -61 +62,0 @@ pub mod stream;
+-pub mod websocket;
+@@ -63,0 +65 @@ pub mod webrtc;
++pub mod websocket;
+@@ -69,0 +72,2 @@ pub mod verifier;
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++mod view_style;
+@@ -70,0 +75 @@ pub use async_recursion;
++pub use libloading;
+@@ -73 +77,0 @@ pub use users;
+-pub use libloading;
+@@ -435 +439,4 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
+-            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn"));
++            init_from_env(Env::default().filter_or(
++                DEFAULT_FILTER_ENV,
++                "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn",
++            ));
+@@ -450 +457,3 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
+-            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn") {
++            if let Ok(x) = Logger::try_with_env_or_str(
++                "debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn",
++            ) {
+@@ -496 +505,2 @@ pub fn version_check_request(typ: String) -> (VersionCheckRequest, String) {
+-    const URL: &str = "https://api.rustdesk.com/version/latest";
++    // No public update endpoint in the private build.
++    const URL: &str = "";
+diff --git a/src/socket_client.rs b/src/socket_client.rs
+index 9178b74..7083fe1 100644
+--- a/src/socket_client.rs
++++ b/src/socket_client.rs
+@@ -189,5 +189,2 @@ pub fn is_ipv4(target: &TargetAddr<'_>) -> bool {
+-pub async fn query_nip_io(addr: &SocketAddr) -> ResultType<SocketAddr> {
+-    tokio::net::lookup_host(format!("{}.nip.io:{}", addr.ip(), addr.port()))
+-        .await?
+-        .find(|x| x.is_ipv6())
+-        .context("Failed to get ipv6 from nip.io")
++pub async fn query_nip_io(_addr: &SocketAddr) -> ResultType<SocketAddr> {
++    anyhow::bail!("Public NAT64 discovery is disabled; configure a reachable IPv6 endpoint")
+@@ -197,6 +194,2 @@ pub async fn query_nip_io(addr: &SocketAddr) -> ResultType<SocketAddr> {
+-pub fn ipv4_to_ipv6(addr: String, ipv4: bool) -> String {
+-    if !ipv4 && crate::is_ipv4_str(&addr) {
+-        if let Some(ip) = addr.split(':').next() {
+-            return addr.replace(ip, &format!("{ip}.nip.io"));
+-        }
+-    }
++pub fn ipv4_to_ipv6(addr: String, _ipv4: bool) -> String {
++    // Do not send an address to an external DNS mapping provider.
+@@ -276,2 +268,0 @@ mod tests {
+-    use std::net::ToSocketAddrs;
+-
+@@ -287,6 +278 @@ mod tests {
+-        assert_eq!(ipv4_to_ipv6("1.1.1.1".to_owned(), true), "1.1.1.1");
+-        assert_eq!(ipv4_to_ipv6("1.1.1.1".to_owned(), false), "1.1.1.1.nip.io");
+-        assert_eq!(
+-            ipv4_to_ipv6("1.1.1.1:8080".to_owned(), false),
+-            "1.1.1.1.nip.io:8080"
+-        );
++        assert_eq!(ipv4_to_ipv6("127.0.0.1".to_owned(), true), "127.0.0.1");
+@@ -294,2 +280,2 @@ mod tests {
+-            ipv4_to_ipv6("rustdesk.com".to_owned(), false),
+-            "rustdesk.com"
++            ipv4_to_ipv6("127.0.0.1:8080".to_owned(), false),
++            "127.0.0.1:8080"
+@@ -297,14 +283,4 @@ mod tests {
+-        if ("rustdesk.com:80")
+-            .to_socket_addrs()
+-            .unwrap()
+-            .next()
+-            .unwrap()
+-            .is_ipv6()
+-        {
+-            assert!(query_nip_io(&"1.1.1.1:80".parse().unwrap())
+-                .await
+-                .unwrap()
+-                .is_ipv6());
+-            return;
+-        }
+-        assert!(query_nip_io(&"1.1.1.1:80".parse().unwrap()).await.is_err());
++        assert_eq!(ipv4_to_ipv6("id.example".to_owned(), false), "id.example");
++        assert!(query_nip_io(&"127.0.0.1:80".parse().unwrap())
++            .await
++            .is_err());
+@@ -315 +291 @@ mod tests {
+-        assert!(!test_if_valid_server("a", false).is_empty());
++        assert!(!test_if_valid_server("[invalid", false).is_empty());
+@@ -319,2 +295,2 @@ mod tests {
+-        assert!(test_if_valid_server("microsoft.com", false).is_empty());
+-        assert!(test_if_valid_server("microsoft.com:1", false).is_empty());
++        assert!(test_if_valid_server("localhost", false).is_empty());
++        assert!(test_if_valid_server("localhost:1", false).is_empty());
+diff --git a/src/stream.rs b/src/stream.rs
+index a8e6b6c..dbc7c3f 100644
+--- a/src/stream.rs
++++ b/src/stream.rs
+@@ -1 +0,0 @@
+-use crate::{config, tcp, websocket, ResultType};
+@@ -3,0 +3 @@ use crate::webrtc;
++use crate::{config, tcp, websocket, ResultType};
+@@ -13,0 +14,2 @@ pub enum Stream {
++    /// Constructed only after the authenticated direct TLS handshake.
++    DirectTls(tcp::FramedStream),
+@@ -23 +25 @@ impl Stream {
+-            Stream::Tcp(s) => s.set_send_timeout(ms),
++            Stream::Tcp(s) | Stream::DirectTls(s) => s.set_send_timeout(ms),
+@@ -33 +35 @@ impl Stream {
+-            Stream::Tcp(s) => s.set_raw(),
++            Stream::Tcp(s) | Stream::DirectTls(s) => s.set_raw(),
+@@ -43 +45 @@ impl Stream {
+-            Stream::Tcp(s) => s.send_bytes(bytes).await,
++            Stream::Tcp(s) | Stream::DirectTls(s) => s.send_bytes(bytes).await,
+@@ -53 +55 @@ impl Stream {
+-            Stream::Tcp(s) => s.send_raw(bytes).await,
++            Stream::Tcp(s) | Stream::DirectTls(s) => s.send_raw(bytes).await,
+@@ -63 +65 @@ impl Stream {
+-            Stream::Tcp(s) => s.set_key(key),
++            Stream::Tcp(s) | Stream::DirectTls(s) => s.set_key(key),
+@@ -73,0 +76 @@ impl Stream {
++            Stream::DirectTls(_) => true,
+@@ -86 +89 @@ impl Stream {
+-            Stream::Tcp(s) => s.next_timeout(timeout).await,
++            Stream::Tcp(s) | Stream::DirectTls(s) => s.next_timeout(timeout).await,
+@@ -111 +114 @@ impl Stream {
+-            Self::Tcp(tcp) => tcp.send(msg).await,
++            Self::Tcp(tcp) | Self::DirectTls(tcp) => tcp.send(msg).await,
+@@ -122 +125 @@ impl Stream {
+-            Self::Tcp(tcp) => tcp.next().await,
++            Self::Tcp(tcp) | Self::DirectTls(tcp) => tcp.next().await,
+@@ -132 +135 @@ impl Stream {
+-            Self::Tcp(tcp) => tcp.local_addr(),
++            Self::Tcp(tcp) | Self::DirectTls(tcp) => tcp.local_addr(),
+diff --git a/src/tcp.rs b/src/tcp.rs
+index 2296edb..ad5867f 100644
+--- a/src/tcp.rs
++++ b/src/tcp.rs
+@@ -1 +1 @@
+-use crate::{bail, bytes_codec::BytesCodec, ResultType, config::Socks5Server, proxy::Proxy};
++use crate::{bail, bytes_codec::BytesCodec, config::Socks5Server, proxy::Proxy, ResultType};
+@@ -65 +65,4 @@ impl DerefMut for DynTcpStream {
+-pub(crate) fn new_socket(addr: std::net::SocketAddr, reuse: bool) -> Result<TcpSocket, std::io::Error> {
++pub(crate) fn new_socket(
++    addr: std::net::SocketAddr,
++    reuse: bool,
++) -> Result<TcpSocket, std::io::Error> {
+diff --git a/src/webrtc.rs b/src/webrtc.rs
+index 8f3c410..405d035 100644
+--- a/src/webrtc.rs
++++ b/src/webrtc.rs
+@@ -42,10 +41,0 @@ const DATA_CHANNEL_BUFFER_SIZE: u16 = u16::MAX;
+-// use 3 public STUN servers to find out the NAT type, 2 must be the same address but different ports
+-// https://stackoverflow.com/questions/72805316/determine-nat-mapping-behaviour-using-two-stun-servers
+-// luckily nextcloud supports two ports for STUN
+-// unluckily webrtc-rs does not use the same port to do the STUN request
+-static DEFAULT_ICE_SERVERS: [&str; 3] = [
+-    "stun:stun.cloudflare.com:3478",
+-    "stun:stun.nextcloud.com:3478",
+-    "stun:stun.nextcloud.com:443",
+-];
+-
+@@ -171,31 +161,6 @@ impl WebRTCStream {
+-        let mut ice_servers = Vec::new();
+-        let cfg = config::Config::get_option(config::keys::OPTION_ICE_SERVERS);
+-
+-        let mut has_stun = false;
+-
+-        for url in cfg.split(',').map(str::trim) {
+-            if let Some(ice_server) = Self::get_ice_server_from_url(url) {
+-                // Detect STUN in user config
+-                if ice_server
+-                    .urls
+-                    .iter()
+-                    .any(|u| u.starts_with("stun:") || u.starts_with("stuns:"))
+-                {
+-                    has_stun = true;
+-                }
+-
+-                ice_servers.push(ice_server);
+-            }
+-        }
+-
+-        // If there is no STUN (either TURN-only or empty config) → prepend defaults
+-        if !has_stun {
+-            ice_servers.insert(
+-                0,
+-                RTCIceServer {
+-                    urls: DEFAULT_ICE_SERVERS.iter().map(|s| s.to_string()).collect(),
+-                    ..Default::default()
+-                },
+-            );
+-        }
+-        ice_servers
++        // Empty configuration uses host candidates only; no public STUN/TURN defaults.
++        config::Config::get_option(config::keys::OPTION_ICE_SERVERS)
++            .split(',')
++            .map(str::trim)
++            .filter_map(Self::get_ice_server_from_url)
++            .collect()
+@@ -518 +482,0 @@ mod tests {
+-    use crate::webrtc::DEFAULT_ICE_SERVERS;
+@@ -571,4 +535 @@ mod tests {
+-        assert_eq!(
+-            WebRTCStream::get_ice_servers()[0].urls[0],
+-            DEFAULT_ICE_SERVERS[0].to_string()
+-        );
++        assert!(WebRTCStream::get_ice_servers().is_empty());
+@@ -589,4 +550 @@ mod tests {
+-        config::Config::set_option(
+-            "ice-servers".to_string(),
+-            "".to_string(),
+-        );
++        config::Config::set_option("ice-servers".to_string(), "".to_string());
+diff --git a/src/direct_tls.rs b/src/direct_tls.rs
+new file mode 100644
+index 0000000..97298a4
+--- /dev/null
++++ b/src/direct_tls.rs
+@@ -0,0 +1,400 @@
++//! Direct TLS 1.3 transport. Trust is supplied by the user, never learned from the socket.
++use crate::{bail, tcp::FramedStream, ResultType, Stream};
++use anyhow::Context;
++use base64::{engine::general_purpose::STANDARD, Engine};
++use data_encoding::BASE32_NOPAD;
++use serde_derive::{Deserialize, Serialize};
++use std::{
++    convert::TryFrom,
++    io::Read,
++    net::{IpAddr, SocketAddr},
++    path::Path,
++    sync::Arc,
++};
++use tokio::io::{AsyncRead, AsyncWrite};
++use tokio_rustls::{
++    rustls::{
++        self,
++        pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName},
++    },
++    TlsAcceptor, TlsConnector,
++};
++
++// This fixed SAN identifies the protocol; it is not a DNS lookup or a public service.
++const SERVER_NAME: &str = "hdobby.direct";
++const ALPN: &[u8] = b"hdobby-direct/1";
++const MAX_IDENTITY_BYTES: u64 = 16 * 1024;
++const MAX_CERT_BYTES: usize = 4096;
++pub const PEER_CERT_OPTION: &str = "direct-tls-trusted-cert";
++pub const IDENTITY_FILE_OPTION: &str = "direct-tls-identity-file";
++
++pub const LISTEN_IP_OPTION: &str = "direct-listen-ip";
++// The transport authenticates the host only. The application lifts this limit
++// after password/approval authorization succeeds.
++pub const UNAUTHENTICATED_MAX_FRAME: usize = 64 * 1024;
++
++/// Optional interface selection, without DNS or profile access. Invalid input never
++/// falls back to all interfaces or wraps into a different TCP port.
++pub fn listener_endpoint(ip: &str, port: &str) -> ResultType<(Option<IpAddr>, u16)> {
++    let port = if port.is_empty() {
++        21118
++    } else {
++        port.parse::<u16>()
++            .ok()
++            .filter(|p| *p > 0)
++            .ok_or_else(|| anyhow::anyhow!("Direct port must be between 1 and 65535"))?
++    };
++    let ip = if ip.is_empty() {
++        None
++    } else {
++        Some(
++            ip.parse::<IpAddr>()
++                .context("Direct listen address must be an IP address")?,
++        )
++    };
++    Ok((ip, port))
++}
++
++/// Validate and normalize a direct address without DNS or profile access.
++pub fn endpoint(value: &str) -> ResultType<String> {
++    if value != value.trim() || value.chars().any(char::is_whitespace) {
++        bail!("Enter a direct IP address or host:port without spaces");
++    }
++    if let Ok(addr) = value.parse::<SocketAddr>() {
++        if addr.port() == 0 {
++            bail!("Direct port must be between 1 and 65535");
++        }
++        return Ok(addr.to_string());
++    }
++    if let Ok(ip) = value.parse::<IpAddr>() {
++        return Ok(SocketAddr::new(ip, 21118).to_string());
++    }
++    if crate::is_domain_port_str(value) || value.starts_with("localhost:") {
++        if let Some((host, port)) = value.rsplit_once(':') {
++            if port.parse::<u16>().ok().filter(|p| *p > 0).is_some() {
++                return Ok(format!("{}:{}", host.to_ascii_lowercase(), port));
++            }
++        }
++    }
++    bail!("Enter a direct IP address or host:port")
++}
++
++/// Private material is deliberately not Debug/Clone. Persist only in private runtime storage.
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Identity {
++    certificate: Vec<u8>,
++    private_key: Vec<u8>,
++}
++
++impl Identity {
++    pub fn load_or_create(path: &Path) -> ResultType<Self> {
++        match std::fs::symlink_metadata(path) {
++            Ok(_) => Self::load(path),
++            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
++                let identity = Self::generate()?;
++                identity.create_file(path)?;
++                // Return only what was successfully persisted, not the in-memory proposal.
++                Self::load(path)
++            }
++            Err(_) => bail!("Cannot inspect direct TLS identity storage"),
++        }
++    }
++
++    /// Move an existing identity to a durable location without rotating it.
++    ///
++    /// The destination always wins. A present but invalid legacy file is an
++    /// error: silently replacing it would invalidate every paired device.
++    pub fn load_or_create_migrating(path: &Path, legacy_paths: &[&Path]) -> ResultType<Self> {
++        match std::fs::symlink_metadata(path) {
++            Ok(_) => return Self::load(path),
++            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
++            Err(_) => bail!("Cannot inspect direct TLS identity storage"),
++        }
++
++        for legacy_path in legacy_paths {
++            if *legacy_path == path {
++                continue;
++            }
++            match std::fs::symlink_metadata(legacy_path) {
++                Ok(_) => {
++                    let identity = Self::load(legacy_path)
++                        .context("Cannot migrate the existing direct TLS identity")?;
++                    if let Err(err) = identity.create_file(path) {
++                        if path.exists() {
++                            return Self::load(path);
++                        }
++                        return Err(err);
++                    }
++                    return Self::load(path);
++                }
++                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
++                Err(_) => bail!("Cannot inspect legacy direct TLS identity storage"),
++            }
++        }
++
++        Self::load_or_create(path)
++    }
++
++    pub fn generate() -> ResultType<Self> {
++        let rcgen::CertifiedKey { cert, key_pair } =
++            rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_owned()])?;
++        Ok(Self {
++            certificate: cert.der().to_vec(),
++            private_key: key_pair.serialize_der(),
++        })
++    }
++
++    /// Public pairing material only. Obtain it from the host through a trusted channel.
++    pub fn pairing_code(&self) -> String {
++        let encoded = BASE32_NOPAD.encode(&self.certificate);
++        let grouped = encoded
++            .as_bytes()
++            .chunks(5)
++            .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
++            .collect::<Vec<_>>()
++            .join("-");
++        format!("hdobby2:{grouped}")
++    }
++
++    pub fn load(path: &Path) -> ResultType<Self> {
++        let mut options = std::fs::OpenOptions::new();
++        options.read(true);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::OpenOptionsExt;
++            // Validate the opened descriptor, not an earlier path lookup. A FIFO
++            // must also fail promptly instead of blocking startup indefinitely.
++            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
++        }
++        let file = options
++            .open(path)
++            .context("Cannot open direct TLS identity")?;
++        let metadata = file
++            .metadata()
++            .context("Cannot inspect direct TLS identity")?;
++        if !metadata.is_file() {
++            bail!("Direct TLS identity must be a regular file");
++        }
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::MetadataExt;
++            if metadata.mode() & 0o077 != 0 || metadata.nlink() != 1 {
++                bail!("Direct TLS identity must be private (mode 0600) with no hard links");
++            }
++        }
++        let mut data = Vec::new();
++        file.take(MAX_IDENTITY_BYTES + 1).read_to_end(&mut data)?;
++        if data.len() as u64 > MAX_IDENTITY_BYTES {
++            bail!("Direct TLS identity is too large");
++        }
++        let identity: Self =
++            serde_json::from_slice(&data).context("Invalid direct TLS identity file")?;
++        identity.server_config()?;
++        Ok(identity)
++    }
++
++    /// Explicit creation only; an existing identity is never overwritten or rotated silently.
++    pub fn create_file(&self, path: &Path) -> ResultType<()> {
++        self.server_config()?;
++        let mut options = std::fs::OpenOptions::new();
++        options.write(true).create_new(true);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::OpenOptionsExt;
++            options.mode(0o600);
++        }
++        let mut file = options
++            .open(path)
++            .context("Cannot create direct TLS identity")?;
++        use std::io::Write;
++        file.write_all(&serde_json::to_vec(self)?)?;
++        file.sync_all()?;
++        Ok(())
++    }
++
++    pub fn server_config(&self) -> ResultType<Arc<rustls::ServerConfig>> {
++        if self.certificate.is_empty()
++            || self.certificate.len() > MAX_CERT_BYTES
++            || self.private_key.is_empty()
++            || self.private_key.len() > MAX_CERT_BYTES
++        {
++            bail!("Invalid direct TLS identity");
++        }
++        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
++            rustls::crypto::ring::default_provider(),
++        ))
++        .with_protocol_versions(&[&rustls::version::TLS13])?
++        .with_no_client_auth()
++        .with_single_cert(
++            vec![CertificateDer::from(self.certificate.clone())],
++            PrivatePkcs8KeyDer::from(self.private_key.clone()).into(),
++        )?;
++        config.alpn_protocols = vec![ALPN.to_vec()];
++        // Every connection reauthenticates its certificate. No 0-RTT/replayable input.
++        config.max_early_data_size = 0;
++        config.send_tls13_tickets = 0;
++        Ok(Arc::new(config))
++    }
++}
++
++/// No default roots, OS roots, network fetches or certificate-verification bypass.
++pub struct PeerTrust {
++    certificate: CertificateDer<'static>,
++    config: Arc<rustls::ClientConfig>,
++}
++
++impl PeerTrust {
++    pub fn fingerprint(&self) -> String {
++        use sha2::{Digest, Sha256};
++        Sha256::digest(self.certificate.as_ref())
++            .chunks(4)
++            .map(|part| part.iter().map(|b| format!("{b:02X}")).collect::<String>())
++            .collect::<Vec<_>>()
++            .join(" ")
++    }
++
++    pub fn from_pairing_code(code: &str) -> ResultType<Self> {
++        let code = code.trim();
++        if code.is_empty() || code.len() > MAX_CERT_BYTES * 3 {
++            bail!("Invalid direct TLS pairing code");
++        }
++        let bytes = if let Some(encoded) = code.strip_prefix("hdobby2:") {
++            let normalized = encoded
++                .bytes()
++                .filter(|byte| *byte != b'-' && !byte.is_ascii_whitespace())
++                .map(|byte| byte.to_ascii_uppercase())
++                .collect::<Vec<_>>();
++            if normalized.is_empty() || normalized.len() > MAX_CERT_BYTES * 2 {
++                bail!("Invalid direct TLS pairing code");
++            }
++            BASE32_NOPAD
++                .decode(&normalized)
++                .context("Invalid direct TLS pairing code")?
++        } else if let Some(encoded) = code.strip_prefix("hdobby1:") {
++            if encoded.is_empty() || encoded.len() > MAX_CERT_BYTES * 2 {
++                bail!("Invalid direct TLS pairing code");
++            }
++            STANDARD
++                .decode(encoded)
++                .context("Invalid direct TLS pairing code")?
++        } else {
++            bail!("Pair the host's direct TLS certificate before connecting");
++        };
++        if bytes.len() > MAX_CERT_BYTES {
++            bail!("Invalid direct TLS pairing certificate");
++        }
++        let certificate = CertificateDer::from(bytes);
++        let mut roots = rustls::RootCertStore::empty();
++        roots
++            .add(certificate.clone())
++            .context("Invalid direct TLS pairing certificate")?;
++        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
++            rustls::crypto::ring::default_provider(),
++        ))
++        .with_protocol_versions(&[&rustls::version::TLS13])?
++        .with_root_certificates(roots)
++        .with_no_client_auth();
++        config.enable_sni = false;
++        config.alpn_protocols = vec![ALPN.to_vec()];
++        config.enable_early_data = false;
++        config.resumption = rustls::client::Resumption::disabled();
++        Ok(Self {
++            certificate,
++            config: Arc::new(config),
++        })
++    }
++}
++
++/// Direct TCP only: does not consult proxy, ID, relay, discovery or previous endpoints.
++pub async fn connect(endpoint: &str, trust: PeerTrust, timeout_ms: u64) -> ResultType<Stream> {
++    let socket = crate::timeout(timeout_ms, tokio::net::TcpStream::connect(endpoint))
++        .await
++        .context("Direct TCP connection timed out")??;
++    socket.set_nodelay(true)?;
++    let address = socket.local_addr()?;
++    connect_stream(socket, address, trust, timeout_ms).await
++}
++
++// Use typed causes rather than error text: an EOF/reset during negotiation is
++// not evidence that the host certificate was rejected. Keep diagnostic values
++// in the error chain, never in the user-facing message.
++fn client_handshake_error(error: std::io::Error) -> anyhow::Error {
++    use rustls::{CertificateError, Error as TlsError};
++    use std::io::ErrorKind;
++
++    let message = match error.get_ref().and_then(|e| e.downcast_ref::<TlsError>()) {
++        Some(TlsError::InvalidCertificate(
++            CertificateError::Expired | CertificateError::ExpiredContext { .. },
++        )) => "Direct TLS certificate expired",
++        Some(TlsError::InvalidCertificate(
++            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. },
++        )) => "Direct TLS certificate not yet valid",
++        Some(TlsError::InvalidCertificate(_)) => "Direct TLS certificate rejected",
++        Some(_) => "Direct TLS protocol negotiation failed",
++        None => match error.kind() {
++            ErrorKind::UnexpectedEof
++            | ErrorKind::ConnectionReset
++            | ErrorKind::ConnectionAborted
++            | ErrorKind::BrokenPipe => "Direct TLS connection closed during handshake",
++            ErrorKind::TimedOut | ErrorKind::WouldBlock => "Direct TLS handshake timed out",
++            _ => "Direct TLS connection failed during handshake",
++        },
++    };
++    anyhow::Error::new(error).context(message)
++}
++
++pub async fn connect_stream<S>(
++    socket: S,
++    address: SocketAddr,
++    trust: PeerTrust,
++    timeout_ms: u64,
++) -> ResultType<Stream>
++where
++    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
++{
++    let connector = TlsConnector::from(trust.config);
++    let stream = crate::timeout(
++        timeout_ms,
++        connector.connect(ServerName::try_from(SERVER_NAME)?, socket),
++    )
++    .await
++    .context("Direct TLS handshake timed out")?
++    .map_err(client_handshake_error)?;
++    let session = stream.get_ref().1;
++    if session.peer_certificates().and_then(|chain| chain.first()) != Some(&trust.certificate)
++        || session.alpn_protocol() != Some(ALPN)
++        || session.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
++    {
++        bail!("Direct TLS peer or protocol does not match the pairing");
++    }
++    Ok(Stream::DirectTls(FramedStream::from(stream, address)))
++}
++
++pub async fn accept_stream<S>(
++    socket: S,
++    address: SocketAddr,
++    config: Arc<rustls::ServerConfig>,
++    timeout_ms: u64,
++) -> ResultType<Stream>
++where
++    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
++{
++    let acceptor = TlsAcceptor::from(config);
++    let stream = crate::timeout(timeout_ms, acceptor.accept(socket))
++        .await
++        .context("Direct TLS handshake timed out")?
++        .context("Direct TLS handshake rejected; no plaintext fallback")?;
++    let session = stream.get_ref().1;
++    if session.alpn_protocol() != Some(ALPN)
++        || session.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
++    {
++        bail!("Direct TLS protocol mismatch");
++    }
++    let mut framed = FramedStream::from(stream, address);
++    framed
++        .0
++        .codec_mut()
++        .set_max_packet_length(UNAUTHENTICATED_MAX_FRAME);
++    Ok(Stream::DirectTls(framed))
++}
+diff --git a/src/private_network.rs b/src/private_network.rs
+new file mode 100644
+index 0000000..b7e2a6a
+--- /dev/null
++++ b/src/private_network.rs
+@@ -0,0 +1,180 @@
++//! Endpoint selection without discovery, cached defaults, or public services.
++//! This module does no DNS lookup and does not determine who operates a host.
++
++use std::net::IpAddr;
++
++fn authority(value: &str) -> Option<(String, Option<u16>)> {
++    let value = value.trim();
++    if value.is_empty() || !value.is_ascii() || value.chars().any(char::is_whitespace) {
++        return None;
++    }
++    let value = if let Some((scheme, rest)) = value.split_once("://") {
++        if !matches!(scheme, "http" | "https") {
++            return None;
++        }
++        rest.split('/').next()?
++    } else {
++        value
++    };
++    if value.contains(['@', '\\', '%', '?', '#', '/']) {
++        return None;
++    }
++    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
++        let (host, rest) = rest.split_once(']')?;
++        host.parse::<std::net::Ipv6Addr>().ok()?;
++        let port = if rest.is_empty() {
++            None
++        } else {
++            Some(rest.strip_prefix(':')?)
++        };
++        (host, port)
++    } else if value.parse::<IpAddr>().is_ok() {
++        (value, None)
++    } else if let Some((host, port)) = value.split_once(':') {
++        (host, Some(port))
++    } else {
++        (value, None)
++    };
++    let host = host.trim_end_matches('.').to_ascii_lowercase();
++    if host.is_empty() {
++        return None;
++    }
++    let host = if let Ok(ip) = host.parse::<IpAddr>() {
++        ip.to_string()
++    } else {
++        if !host.split('.').all(|label| {
++            !label.is_empty()
++                && label.len() <= 63
++                && !label.starts_with('-')
++                && !label.ends_with('-')
++                && label
++                    .bytes()
++                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
++        }) {
++            return None;
++        }
++        host
++    };
++    let port = match port {
++        Some(p) => {
++            let p = p.parse::<u16>().ok()?;
++            if p == 0 {
++                return None;
++            }
++            Some(p)
++        }
++        None => None,
++    };
++    Some((host, port))
++}
++
++/// Validate an explicitly supplied endpoint. Never returns a default.
++pub fn explicit_endpoint(value: &str) -> Option<String> {
++    let (host, _) = authority(value)?;
++    if host == "rustdesk.com" || host.ends_with(".rustdesk.com") || host == "public" {
++        return None;
++    }
++    Some(value.trim().to_owned())
++}
++
++/// Only explicit options participate. A rejected higher-priority value fails closed.
++pub fn rendezvous_endpoint(values: &[String]) -> Option<String> {
++    let value = values.iter().find(|v| !v.trim().is_empty())?;
++    if value.contains("://") {
++        return None;
++    }
++    explicit_endpoint(value)
++}
++
++/// Compare the advertised relay with the user's separately configured relay.
++/// DNS aliases and redirects are deliberately not resolved or followed here.
++pub fn relay_allowed(advertised: &str, configured: &str, default_port: u16) -> bool {
++    if advertised.contains("://")
++        || configured.contains("://")
++        || explicit_endpoint(advertised).is_none()
++        || explicit_endpoint(configured).is_none()
++    {
++        return false;
++    }
++    match (authority(advertised), authority(configured)) {
++        (Some((a, ap)), Some((b, bp))) => {
++            a == b && ap.unwrap_or(default_port) == bp.unwrap_or(default_port)
++        }
++        _ => false,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn no_default_or_cached_server() {
++        assert_eq!(rendezvous_endpoint(&[]), None);
++        assert_eq!(rendezvous_endpoint(&[String::new(), " ".into()]), None);
++        assert_eq!(
++            rendezvous_endpoint(&["id.example:21116".into()]),
++            Some("id.example:21116".into())
++        );
++        assert_eq!(
++            rendezvous_endpoint(&["rs-ny.rustdesk.com".into(), "id.example".into()]),
++            None
++        );
++    }
++
++    #[test]
++    fn vendor_and_ambiguous_endpoints_are_rejected() {
++        for value in [
++            "public",
++            "rs-ny.rustdesk.com:21116",
++            "HTTPS://admin.rustdesk.com",
++            "https://ADMIN.RUSTDESK.COM.:21114/api",
++            "id.example@rustdesk.com",
++            "id.example\\@rustdesk.com",
++            "https://%72ustdesk.com",
++            "id.example:0",
++            "id.example:99999",
++            "id.example:invalid",
++            "",
++        ] {
++            assert!(
++                explicit_endpoint(value).is_none(),
++                "rejected endpoint was accepted"
++            );
++        }
++        assert!(explicit_endpoint("https://api.example:21114").is_some());
++        assert!(explicit_endpoint("https://rustdesk.com.example").is_some());
++    }
++
++    #[test]
++    fn relay_requires_explicit_exact_host_and_port() {
++        assert!(!relay_allowed("relay.example", "", 21117));
++        assert!(!relay_allowed("other.example", "relay.example", 21117));
++        assert!(!relay_allowed(
++            "relay.example:21118",
++            "relay.example",
++            21117
++        ));
++        assert!(!relay_allowed(
++            "rs-ny.rustdesk.com",
++            "rs-ny.rustdesk.com",
++            21117
++        ));
++        assert!(relay_allowed(
++            "Relay.Example.:21117",
++            "relay.example",
++            21117
++        ));
++        assert!(relay_allowed("[::1]:21117", "::1", 21117));
++        assert!(relay_allowed(
++            "[2001:db8::1]:21117",
++            "2001:db8:0:0::1",
++            21117
++        ));
++        assert!(!relay_allowed(
++            "https://relay.example",
++            "relay.example",
++            21117
++        ));
++    }
++}
+diff --git a/src/view_style.rs b/src/view_style.rs
+new file mode 100644
+index 0000000..e5826a0
+--- /dev/null
++++ b/src/view_style.rs
+@@ -0,0 +1,58 @@
++use std::collections::HashMap;
++
++pub(crate) const HDOBBY_ADAPTIVE_VIEW_MIGRATION: &str = "hdobby-adaptive-view-v1";
++
++pub(crate) fn migrate_legacy_desktop_view_style(
++    view_style: &mut String,
++    ui_flutter: &mut HashMap<String, String>,
++) -> bool {
++    if ui_flutter
++        .get(HDOBBY_ADAPTIVE_VIEW_MIGRATION)
++        .map(|value| value == "Y")
++        .unwrap_or(false)
++    {
++        return false;
++    }
++
++    // Older desktop builds stored their 1:1 default as an explicit peer
++    // preference. Migrate it once so resizing the client window scales the
++    // canvas. A later explicit choice of 1:1 remains untouched because the
++    // marker is already present. This changes only client-side rendering;
++    // the host display resolution is never changed here.
++    if view_style == "original" {
++        *view_style = "adaptive".to_owned();
++    }
++    ui_flutter.insert(HDOBBY_ADAPTIVE_VIEW_MIGRATION.to_owned(), "Y".to_owned());
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn legacy_original_migrates_once() {
++        let mut style = "original".to_owned();
++        let mut ui = HashMap::new();
++
++        assert!(migrate_legacy_desktop_view_style(&mut style, &mut ui));
++        assert_eq!(style, "adaptive");
++
++        style = "original".to_owned();
++        assert!(!migrate_legacy_desktop_view_style(&mut style, &mut ui));
++        assert_eq!(style, "original");
++    }
++
++    #[test]
++    fn existing_adaptive_style_is_marked_without_change() {
++        let mut style = "adaptive".to_owned();
++        let mut ui = HashMap::new();
++
++        assert!(migrate_legacy_desktop_view_style(&mut style, &mut ui));
++        assert_eq!(style, "adaptive");
++        assert_eq!(
++            ui.get(HDOBBY_ADAPTIVE_VIEW_MIGRATION).map(String::as_str),
++            Some("Y")
++        );
++    }
++}

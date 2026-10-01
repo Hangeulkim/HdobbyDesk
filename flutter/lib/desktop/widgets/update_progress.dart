@@ -36,22 +36,23 @@ void handleUpdate(String releasePageUrl) {
                 .marginSymmetric(horizontal: 8)
                 .paddingOnly(top: 12),
         actions: [
-          if (_isExtracting.isFalse) dialogButton(translate('Cancel'), onPressed: () async {
-            onCanceled.value();
-            await bind.mainSetCommon(
-                key: 'cancel-downloader', value: downloadId.value);
-            // Wait for the downloader to be removed.
-            for (int i = 0; i < 10; i++) {
-              await Future.delayed(const Duration(milliseconds: 300));
-              final isCanceled = 'error:Downloader not found' ==
-                  await bind.mainGetCommon(
-                      key: 'download-data-${downloadId.value}');
-              if (isCanceled) {
-                break;
+          if (_isExtracting.isFalse)
+            dialogButton(translate('Cancel'), onPressed: () async {
+              onCanceled.value();
+              await bind.mainSetCommon(
+                  key: 'cancel-downloader', value: downloadId.value);
+              // Wait for the downloader to be removed.
+              for (int i = 0; i < 10; i++) {
+                await Future.delayed(const Duration(milliseconds: 300));
+                final isCanceled = 'error:Downloader not found' ==
+                    await bind.mainGetCommon(
+                        key: 'download-data-${downloadId.value}');
+                if (isCanceled) {
+                  break;
+                }
               }
-            }
-            close();
-          }, isOutline: true),
+              close();
+            }, isOutline: true),
         ]);
   });
 }

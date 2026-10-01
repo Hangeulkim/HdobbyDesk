@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -92,6 +93,10 @@ class _RawTouchGestureDetectorRegionState
   int _cacheLongPressPositionTs = 0;
   double _mouseScrollIntegral = 0; // mouse scroll speed controller
   double _scale = 1;
+  int _touchPanGeneration = 0;
+  Future<void>? _touchPanPress;
+  bool _touchPanButtonDown = false;
+  Future<void>? _holdDragPress;
 
   // Workaround tap down event when two fingers are used to scale(mobile)
   TapDownDetails? _lastTapDownDetails;
@@ -328,7 +333,14 @@ class _RawTouchGestureDetectorRegionState
     }
     if (!handleTouch) {
       if (isSpecialHoldDragActive) return;
-      await inputModel.sendMouse('down', MouseButtons.left);
+      final press = inputModel.sendMouse('down', MouseButtons.left);
+      _holdDragPress = press;
+      try {
+        await press;
+      } catch (error) {
+        _holdDragPress = null;
+        debugPrint('Hold drag press failed: $error');
+      }
     }
   }
 
@@ -338,6 +350,13 @@ class _RawTouchGestureDetectorRegionState
     }
     if (!handleTouch) {
       if (isSpecialHoldDragActive) return;
+      final press = _holdDragPress;
+      if (press == null) return;
+      try {
+        await press;
+      } catch (_) {
+        return;
+      }
       await ffi.cursorModel.updatePan(d.delta, d.localPosition, handleTouch);
     }
   }
@@ -346,12 +365,11 @@ class _RawTouchGestureDetectorRegionState
     if (isNotTouchBasedDevice()) {
       return;
     }
-    if (!handleTouch) {
-      await inputModel.sendMouse('up', MouseButtons.left);
-    }
+    await _finishHoldDrag();
   }
 
   onOneFingerPanStart(BuildContext context, DragStartDetails d) async {
+    final generation = ++_touchPanGeneration;
     final TapDownDetails? lastTapDownDetails = _lastTapDownDetails;
     _lastTapDownDetails = null;
     lastDeviceKind = d.kind ?? lastDeviceKind;
@@ -363,6 +381,7 @@ class _RawTouchGestureDetectorRegionState
         await ffi.cursorModel.move(lastTapDownDetails.localPosition.dx,
             lastTapDownDetails.localPosition.dy);
       }
+      if (generation != _touchPanGeneration) return;
       if (ffi.cursorModel.shouldBlock(d.localPosition.dx, d.localPosition.dy)) {
         return;
       }
@@ -385,10 +404,19 @@ class _RawTouchGestureDetectorRegionState
         await ffi.cursorModel
             .move(_cacheLongPressPosition.dx, _cacheLongPressPosition.dy);
       }
-      // In relative mouse mode, skip mouse down - only send movement via sendMobileRelativeMouseMove
-      if (!inputModel.relativeMouseMode.value) {
-        await inputModel.sendMouse('down', MouseButtons.left);
+      if (generation != _touchPanGeneration) return;
+      // A drag must hold the left button even when its movement is relative.
+      final press = inputModel.sendMouse('down', MouseButtons.left);
+      _touchPanPress = press;
+      try {
+        await press;
+      } catch (error) {
+        debugPrint('Touch drag press failed: $error');
+        _touchModePanStarted = false;
+        return;
       }
+      if (generation != _touchPanGeneration) return;
+      _touchPanButtonDown = true;
       await ffi.cursorModel.move(d.localPosition.dx, d.localPosition.dy);
     } else {
       final offset = ffi.cursorModel.offset;
@@ -413,6 +441,14 @@ class _RawTouchGestureDetectorRegionState
     if (handleTouch && !_touchModePanStarted) {
       return;
     }
+    if (handleTouch && _touchPanPress != null) {
+      try {
+        await _touchPanPress;
+      } catch (_) {
+        return;
+      }
+      if (!_touchModePanStarted) return;
+    }
     // In relative mouse mode, send delta directly without position tracking.
     if (inputModel.relativeMouseMode.value) {
       await inputModel.sendMobileRelativeMouseMove(d.delta.dx, d.delta.dy);
@@ -422,18 +458,33 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onOneFingerPanEnd(DragEndDetails d) async {
-    _touchModePanStarted = false;
+    await _finishTouchPan();
     if (isNotTouchBasedDevice()) {
       return;
     }
     if (isDesktop || isWebDesktop) {
       ffi.cursorModel.clearRemoteWindowCoords();
     }
-    if (handleTouch) {
-      // In relative mouse mode, skip mouse up - matches the skipped mouse down in onOneFingerPanStart
-      if (!inputModel.relativeMouseMode.value) {
-        await inputModel.sendMouse('up', MouseButtons.left);
+  }
+
+  Future<void> _finishTouchPan() async {
+    _touchModePanStarted = false;
+    _touchPanGeneration++;
+    final press = _touchPanPress;
+    _touchPanPress = null;
+    if (press != null) {
+      try {
+        await press;
+      } catch (_) {
+        _touchPanButtonDown = false;
+        return;
       }
+      // Release even if the gesture ended before the press callback resumed.
+      _touchPanButtonDown = false;
+      await inputModel.sendMouse('up', MouseButtons.left);
+    } else if (_touchPanButtonDown) {
+      _touchPanButtonDown = false;
+      await inputModel.sendMouse('up', MouseButtons.left);
     }
   }
 
@@ -442,12 +493,13 @@ class _RawTouchGestureDetectorRegionState
   // stuck in the "started" state and cause issues such as the Magic Mouse
   // double-click problem on iPad with magic mouse.
   onOneFingerPanCancel() {
-    _touchModePanStarted = false;
+    unawaited(_finishTouchPan());
   }
 
   // scale + pan event
   onTwoFingerScaleStart(ScaleStartDetails d) {
     _lastTapDownDetails = null;
+    if (_touchModePanStarted) unawaited(_finishTouchPan());
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -509,11 +561,26 @@ class _RawTouchGestureDetectorRegionState
       // bind.sessionSetViewStyle(sessionId: sessionId, value: "");
     }
     if (!isSpecialHoldDragActive) {
-      await inputModel.sendMouse('up', MouseButtons.left);
+      await _finishTouchPan();
     }
   }
 
-  get onHoldDragCancel => null;
+  onHoldDragCancel() async {
+    await _finishHoldDrag();
+  }
+
+  Future<void> _finishHoldDrag() async {
+    final press = _holdDragPress;
+    _holdDragPress = null;
+    if (press == null) return;
+    try {
+      await press;
+    } catch (_) {
+      return;
+    }
+    await inputModel.sendMouse('up', MouseButtons.left);
+  }
+
   get onThreeFingerVerticalDragUpdate => ffi.ffiModel.isPeerAndroid
       ? null
       : (d) {

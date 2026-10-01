@@ -14,9 +14,10 @@ pub const FILE_CLIPBOARD_NAME: &'static str = "file-clipboard";
 pub const CLIPBOARD_INTERVAL: u64 = 333;
 
 // This format is used to store the flag in the clipboard.
-const RUSTDESK_CLIPBOARD_OWNER_FORMAT: &'static str = "dyn.com.rustdesk.owner";
+const HDOBBYDESK_CLIPBOARD_OWNER_FORMAT: &'static str = "dyn.com.hdobbydesk.owner";
 
 // Add special format for Excel XML Spreadsheet
+#[cfg(target_os = "windows")]
 const CLIPBOARD_FORMAT_EXCEL_XML_SPREADSHEET: &'static str = "XML Spreadsheet";
 
 #[cfg(not(target_os = "android"))]
@@ -46,8 +47,10 @@ const SUPPORTED_FORMATS: &[ClipboardFormat] = &[
     ClipboardFormat::ImageSvg,
     #[cfg(feature = "unix-file-copy-paste")]
     ClipboardFormat::FileUrl,
+    // This is a Windows registered format, not a valid macOS pasteboard UTI.
+    #[cfg(target_os = "windows")]
     ClipboardFormat::Special(CLIPBOARD_FORMAT_EXCEL_XML_SPREADSHEET),
-    ClipboardFormat::Special(RUSTDESK_CLIPBOARD_OWNER_FORMAT),
+    ClipboardFormat::Special(HDOBBYDESK_CLIPBOARD_OWNER_FORMAT),
 ];
 
 #[cfg(not(target_os = "android"))]
@@ -98,14 +101,14 @@ fn read_clipboard_message(
 }
 
 #[cfg(all(feature = "unix-file-copy-paste", target_os = "macos"))]
-pub fn is_file_url_set_by_rustdesk(url: &Vec<String>) -> bool {
+pub fn is_file_url_set_by_hdobbydesk(url: &Vec<String>) -> bool {
     if url.len() != 1 {
         return false;
     }
     url.iter()
         .next()
         .map(|s| {
-            for prefix in &["file:///tmp/.rustdesk_", "//tmp/.rustdesk_"] {
+            for prefix in &["file:///tmp/.hdobbydesk_", "//tmp/.hdobbydesk_"] {
                 if s.starts_with(prefix) {
                     return s[prefix.len()..].parse::<uuid::Uuid>().is_ok();
                 }
@@ -262,7 +265,7 @@ fn do_update_clipboard_(mut to_update_data: Vec<ClipboardData>, side: ClipboardS
 #[cfg(not(target_os = "android"))]
 fn append_owner_marker(mut data: Vec<ClipboardData>, side: ClipboardSide) -> Vec<ClipboardData> {
     data.push(ClipboardData::Special((
-        RUSTDESK_CLIPBOARD_OWNER_FORMAT.to_owned(),
+        HDOBBYDESK_CLIPBOARD_OWNER_FORMAT.to_owned(),
         side.get_owner_data(),
     )));
     data
@@ -390,7 +393,7 @@ impl ClipboardContext {
         if !force {
             for c in data.iter() {
                 if let ClipboardData::Special((s, d)) = c {
-                    if s == RUSTDESK_CLIPBOARD_OWNER_FORMAT && side.is_owner(d) {
+                    if s == HDOBBYDESK_CLIPBOARD_OWNER_FORMAT && side.is_owner(d) {
                         return Ok(vec![]);
                     }
                 }
@@ -399,7 +402,7 @@ impl ClipboardContext {
         Ok(data
             .into_iter()
             .filter(|c| match c {
-                ClipboardData::Special((s, _)) => s != RUSTDESK_CLIPBOARD_OWNER_FORMAT,
+                ClipboardData::Special((s, _)) => s != HDOBBYDESK_CLIPBOARD_OWNER_FORMAT,
                 // Skip synchronizing empty text to the remote clipboard
                 ClipboardData::Text(text) => !text.is_empty(),
                 _ => true,
@@ -416,7 +419,7 @@ impl ClipboardContext {
         let data = self.get_formats_filter(
             &[
                 ClipboardFormat::FileUrl,
-                ClipboardFormat::Special(RUSTDESK_CLIPBOARD_OWNER_FORMAT),
+                ClipboardFormat::Special(HDOBBYDESK_CLIPBOARD_OWNER_FORMAT),
             ],
             side,
             force,
@@ -452,13 +455,13 @@ impl ClipboardContext {
     }
 
     #[cfg(all(feature = "unix-file-copy-paste", target_os = "macos"))]
-    fn get_file_urls_set_by_rustdesk(
+    fn get_file_urls_set_by_hdobbydesk(
         data: Vec<ClipboardData>,
         _side: ClipboardSide,
     ) -> Vec<String> {
         for item in data.into_iter() {
             if let ClipboardData::FileUrl(urls) = item {
-                if is_file_url_set_by_rustdesk(&urls) {
+                if is_file_url_set_by_hdobbydesk(&urls) {
                     return urls;
                 }
             }
@@ -467,7 +470,7 @@ impl ClipboardContext {
     }
 
     #[cfg(all(feature = "unix-file-copy-paste", target_os = "linux"))]
-    fn get_file_urls_set_by_rustdesk(data: Vec<ClipboardData>, side: ClipboardSide) -> Vec<String> {
+    fn get_file_urls_set_by_hdobbydesk(data: Vec<ClipboardData>, side: ClipboardSide) -> Vec<String> {
         let exclude_path =
             clipboard::platform::unix::fuse::get_exclude_paths(side == ClipboardSide::Client);
         data.into_iter()
@@ -487,7 +490,7 @@ impl ClipboardContext {
     fn try_empty_clipboard_files(&mut self, side: ClipboardSide) {
         let _lock = ARBOARD_MTX.lock().unwrap();
         if let Ok(data) = self.get_formats(&[ClipboardFormat::FileUrl]) {
-            let urls = Self::get_file_urls_set_by_rustdesk(data, side);
+            let urls = Self::get_file_urls_set_by_hdobbydesk(data, side);
             if !urls.is_empty() {
                 // FIXME:
                 // The host-side clear file clipboard `let _ = self.inner.clear();`,
@@ -501,7 +504,7 @@ impl ClipboardContext {
                 #[cfg(target_os = "macos")]
                 let is_kde_x11 = false;
                 let clear_holder_text = if is_kde_x11 {
-                    "RustDesk placeholder to clear the file clipboard"
+                    "HdobbyDesk placeholder to clear the file clipboard"
                 } else {
                     ""
                 }
@@ -510,7 +513,7 @@ impl ClipboardContext {
                     .set_formats(&[
                         ClipboardData::Text(clear_holder_text),
                         ClipboardData::Special((
-                            RUSTDESK_CLIPBOARD_OWNER_FORMAT.to_owned(),
+                            HDOBBYDESK_CLIPBOARD_OWNER_FORMAT.to_owned(),
                             side.get_owner_data(),
                         )),
                     ])
@@ -606,9 +609,58 @@ mod proto {
     #[cfg(not(target_os = "android"))]
     use arboard::ClipboardData;
     use hbb_common::{
-        compress::{compress as compress_func, decompress},
+        compress::{compress as compress_func, decompress_limited},
         message_proto::{Clipboard, ClipboardFormat, Message, MultiClipboards},
     };
+
+    const MAX_REPRESENTATIONS: usize = 16;
+    const MAX_REPRESENTATION_BYTES: usize = 64 * 1024 * 1024;
+    // Leave room for protobuf fields under the Android 80 MiB message limit.
+    const MAX_TOTAL_BYTES: usize = 80 * 1024 * 1024 - 128 * 1024;
+
+    /// Validate the complete update before touching the OS clipboard or Android JNI.
+    /// A bad representation must not turn into empty text or a partial update.
+    pub(super) fn decode_multi_clipboards(mut clips: Vec<Clipboard>) -> Option<Vec<Clipboard>> {
+        if clips.len() > MAX_REPRESENTATIONS {
+            return None;
+        }
+        let mut remaining = MAX_TOTAL_BYTES;
+        for clip in &mut clips {
+            // Unused wire fields must not bypass the budget when sent through JNI.
+            clip.special_fields.clear();
+            let limit = remaining.min(MAX_REPRESENTATION_BYTES);
+            if clip.content.len() > MAX_REPRESENTATION_BYTES || clip.special_name.len() > 4096 {
+                return None;
+            }
+            if clip.compress {
+                clip.content = decompress_limited(&clip.content, limit).ok()?.into();
+                clip.compress = false;
+            } else if clip.content.len() > limit {
+                return None;
+            }
+            remaining = remaining.checked_sub(clip.content.len())?;
+            match clip.format.enum_value() {
+                Ok(ClipboardFormat::ImageRgba) => {
+                    let width = usize::try_from(clip.width).ok()?;
+                    let height = usize::try_from(clip.height).ok()?;
+                    let required = width.checked_mul(height)?.checked_mul(4)?;
+                    if width == 0 || height == 0 || required != clip.content.len() {
+                        return None;
+                    }
+                }
+                Ok(
+                    ClipboardFormat::Text
+                    | ClipboardFormat::Html
+                    | ClipboardFormat::Rtf
+                    | ClipboardFormat::ImageSvg,
+                ) => {
+                    std::str::from_utf8(&clip.content).ok()?;
+                }
+                _ => {}
+            }
+        }
+        Some(clips)
+    }
 
     fn plain_to_proto(s: String, format: ClipboardFormat) -> Clipboard {
         let compressed = compress_func(s.as_bytes());
@@ -676,7 +728,7 @@ mod proto {
         let content = if compress {
             compressed
         } else {
-            s.bytes().collect::<Vec<u8>>()
+            d
         };
         Clipboard {
             compress,
@@ -713,11 +765,7 @@ mod proto {
 
     #[cfg(not(target_os = "android"))]
     fn from_clipboard(clipboard: Clipboard) -> Option<ClipboardData> {
-        let data = if clipboard.compress {
-            decompress(&clipboard.content)
-        } else {
-            clipboard.content.into()
-        };
+        let data: Vec<u8> = clipboard.content.into();
         match clipboard.format.enum_value() {
             Ok(ClipboardFormat::Text) => String::from_utf8(data).ok().map(ClipboardData::Text),
             Ok(ClipboardFormat::Rtf) => String::from_utf8(data).ok().map(ClipboardData::Rtf),
@@ -742,7 +790,11 @@ mod proto {
 
     #[cfg(not(target_os = "android"))]
     pub fn from_multi_clipboards(multi_clipboards: Vec<Clipboard>) -> Vec<ClipboardData> {
-        multi_clipboards
+        let Some(clipboards) = decode_multi_clipboards(multi_clipboards) else {
+            hbb_common::log::warn!("Rejected malformed or oversized clipboard update");
+            return Vec::new();
+        };
+        clipboards
             .into_iter()
             .filter_map(from_clipboard)
             .collect()
@@ -768,34 +820,208 @@ mod proto {
                 msg
             })
     }
-}
 
-#[cfg(target_os = "android")]
-pub fn handle_msg_clipboard(mut cb: Clipboard) {
-    use hbb_common::protobuf::Message;
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use hbb_common::compress::decompress;
 
-    if cb.compress {
-        cb.content = bytes::Bytes::from(hbb_common::compress::decompress(&cb.content));
-    }
-    let multi_clips = MultiClipboards {
-        clipboards: vec![cb],
-        ..Default::default()
-    };
-    if let Ok(bytes) = multi_clips.write_to_bytes() {
-        let _ = scrap::android::ffi::call_clipboard_manager_update_clipboard(&bytes);
-    }
-}
+        #[test]
+        fn small_special_clipboard_preserves_payload_instead_of_format_name() {
+            let payload = vec![0, 255, 1, 128];
+            let clip = special_to_proto(payload.clone(), "application.test".into());
+            assert!(!clip.compress);
+            assert_eq!(clip.content.as_ref(), payload.as_slice());
+            assert_eq!(clip.special_name, "application.test");
+        }
 
-#[cfg(target_os = "android")]
-pub fn handle_msg_multi_clipboards(mut mcb: MultiClipboards) {
-    use hbb_common::protobuf::Message;
+        #[test]
+        fn compressed_special_clipboard_preserves_payload() {
+            let payload = vec![b'x'; 4096];
+            let clip = special_to_proto(payload.clone(), "application.test".into());
+            assert!(clip.compress);
+            assert_eq!(decompress(&clip.content), payload);
+        }
 
-    for cb in mcb.clipboards.iter_mut() {
-        if cb.compress {
-            cb.content = bytes::Bytes::from(hbb_common::compress::decompress(&cb.content));
+        #[cfg(not(target_os = "android"))]
+        #[test]
+        fn received_invalid_rgba_is_rejected_before_os_clipboard() {
+            for (width, height, size) in [
+                (-1, 1, 4),
+                (1, -1, 4),
+                (0, 1, 0),
+                (2, 1, 4),
+                (i32::MAX, i32::MAX, 4),
+            ] {
+                let clip = Clipboard {
+                    format: ClipboardFormat::ImageRgba.into(),
+                    width,
+                    height,
+                    content: vec![0; size].into(),
+                    ..Default::default()
+                };
+                assert!(from_multi_clipboards(vec![clip]).is_empty());
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        #[test]
+        fn received_corrupt_compression_does_not_become_empty_text() {
+            let clip = Clipboard {
+                format: ClipboardFormat::Text.into(),
+                compress: true,
+                content: b"not a zstd frame".to_vec().into(),
+                ..Default::default()
+            };
+            assert!(from_multi_clipboards(vec![clip]).is_empty());
+        }
+
+        #[test]
+        fn bounded_decoder_checks_exact_limit_truncation_and_concatenated_frames() {
+            assert!(decompress_limited(b"", 100).is_err());
+            assert_eq!(decompress_limited(&compress_func(b""), 0).unwrap(), b"");
+            let encoded = compress_func(b"first");
+            assert_eq!(decompress_limited(&encoded, 5).unwrap(), b"first");
+            assert!(decompress_limited(&encoded, 4).is_err());
+            assert!(decompress_limited(&encoded[..encoded.len() - 1], 100).is_err());
+            let mut concatenated = encoded;
+            concatenated.extend(compress_func(b"second"));
+            assert_eq!(
+                decompress_limited(&concatenated, 11).unwrap(),
+                b"firstsecond"
+            );
+            assert!(decompress_limited(&concatenated, 10).is_err());
+            assert!(decompress_limited(&concatenated, usize::MAX).is_err());
+        }
+
+        #[test]
+        fn all_representations_share_one_decompressed_budget() {
+            let chunk = MAX_TOTAL_BYTES / 5;
+            let content = compress_func(&vec![b'x'; chunk]);
+            let clip = Clipboard {
+                format: ClipboardFormat::Text.into(),
+                compress: true,
+                content: content.into(),
+                ..Default::default()
+            };
+            let mut at_limit = vec![clip.clone(); 5];
+            at_limit.push(plain_to_proto(
+                "x".repeat(MAX_TOTAL_BYTES % 5),
+                ClipboardFormat::Text,
+            ));
+            // A valid compressed empty representation needs no output budget.
+            at_limit.push(Clipboard {
+                format: ClipboardFormat::Text.into(),
+                compress: true,
+                content: compress_func(b"").into(),
+                ..Default::default()
+            });
+            assert!(decode_multi_clipboards(at_limit).is_some());
+            assert!(decode_multi_clipboards(vec![clip; 6]).is_none());
+        }
+
+        #[test]
+        fn representation_count_and_raw_size_are_bounded() {
+            assert!(
+                decode_multi_clipboards(vec![Clipboard::default(); MAX_REPRESENTATIONS]).is_some()
+            );
+            assert!(
+                decode_multi_clipboards(vec![Clipboard::default(); MAX_REPRESENTATIONS + 1])
+                    .is_none()
+            );
+            let clip = Clipboard {
+                content: vec![0; MAX_REPRESENTATION_BYTES + 1].into(),
+                ..Default::default()
+            };
+            assert!(decode_multi_clipboards(vec![clip]).is_none());
+        }
+
+        #[test]
+        fn invalid_representation_rejects_whole_update() {
+            let valid = plain_to_proto("preserve this text".into(), ClipboardFormat::Text);
+            let invalid = Clipboard {
+                format: ClipboardFormat::Html.into(),
+                content: vec![0xff].into(),
+                ..Default::default()
+            };
+            assert!(decode_multi_clipboards(vec![valid, invalid]).is_none());
+        }
+
+        #[test]
+        fn unused_wire_fields_are_removed_before_android_serialization() {
+            let mut clip = plain_to_proto("한글".into(), ClipboardFormat::Text);
+            clip.special_fields
+                .mut_unknown_fields()
+                .add_length_delimited(99, vec![0; 512]);
+            let decoded = decode_multi_clipboards(vec![clip]).unwrap();
+            assert!(decoded[0]
+                .special_fields
+                .unknown_fields()
+                .iter()
+                .next()
+                .is_none());
+            assert_eq!(decoded[0].content.as_ref(), "한글".as_bytes());
+        }
+
+        #[cfg(not(target_os = "android"))]
+        #[test]
+        fn valid_unicode_rich_text_rgba_and_special_data_are_preserved() {
+            let text = "한글 English 😀\n\t";
+            let rgba = vec![255, 0, 0, 255, 0, 255, 0, 255];
+            let png = include_bytes!("../res/32x32.png");
+            let input = vec![
+                ClipboardData::Text(text.into()),
+                ClipboardData::Html(format!("<b>{text}</b>")),
+                ClipboardData::Rtf("{\\rtf1 example}".into()),
+                ClipboardData::Image(arboard::ImageData::rgba(2, 1, rgba.clone().into())),
+                ClipboardData::Special(("application.test".into(), vec![0, 255, 128])),
+                ClipboardData::Image(arboard::ImageData::png(png.as_slice().into())),
+            ];
+            let output = from_multi_clipboards(create_multi_clipboards(input).clipboards);
+            assert_eq!(output.len(), 6);
+            assert!(matches!(&output[0], ClipboardData::Text(value) if value == text));
+            assert!(
+                matches!(&output[1], ClipboardData::Html(value) if value == &format!("<b>{text}</b>"))
+            );
+            assert!(matches!(&output[2], ClipboardData::Rtf(value) if value == "{\\rtf1 example}"));
+            assert!(
+                matches!(&output[3], ClipboardData::Image(arboard::ImageData::Rgba(value))
+                if value.width == 2 && value.height == 1 && value.bytes.as_ref() == rgba)
+            );
+            assert!(matches!(&output[4], ClipboardData::Special((name, value))
+                if name == "application.test" && value == &[0, 255, 128]));
+            assert!(
+                matches!(&output[5], ClipboardData::Image(arboard::ImageData::Png(value))
+                if value.as_ref() == png)
+            );
+            let clear =
+                from_multi_clipboards(vec![plain_to_proto("".into(), ClipboardFormat::Text)]);
+            assert!(matches!(&clear[0], ClipboardData::Text(value) if value.is_empty()));
         }
     }
-    if let Ok(bytes) = mcb.write_to_bytes() {
+}
+
+#[cfg(target_os = "android")]
+pub fn handle_msg_clipboard(cb: Clipboard) {
+    handle_msg_multi_clipboards(MultiClipboards {
+        clipboards: vec![cb],
+        ..Default::default()
+    });
+}
+
+#[cfg(target_os = "android")]
+pub fn handle_msg_multi_clipboards(mcb: MultiClipboards) {
+    use hbb_common::protobuf::Message;
+
+    let Some(clipboards) = proto::decode_multi_clipboards(mcb.clipboards) else {
+        log::warn!("Rejected malformed or oversized clipboard update");
+        return;
+    };
+    let decoded = MultiClipboards {
+        clipboards,
+        ..Default::default()
+    };
+    if let Ok(bytes) = decoded.write_to_bytes() {
         let _ = scrap::android::ffi::call_clipboard_manager_update_clipboard(&bytes);
     }
 }

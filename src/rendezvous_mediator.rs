@@ -62,7 +62,7 @@ lazy_static::lazy_static! {
 
 // Single source of truth for the "awaiting deployment" backoff. The server has
 // already told us this device is not in its db; until the operator runs
-// `rustdesk --deploy --token <api_token>` there is no point re-running the
+// `hdobbydesk --deploy --token <api_token>` there is no point re-running the
 // register path more often than DEPLOY_RETRY_INTERVAL. Gating in the timer
 // loops (rather than only inside register_pk) also avoids the
 // last_register_sent / fails / latency / UDP-rebind churn the loop would
@@ -114,6 +114,8 @@ impl RendezvousMediator {
     }
 
     pub async fn start_all() {
+        #[cfg(target_os = "windows")]
+        crate::platform::windows::write_direct_host_status("start_all");
         crate::test_nat_type();
         if config::is_outgoing_only() {
             loop {
@@ -126,7 +128,11 @@ impl RendezvousMediator {
             crate::updater::start_auto_update();
         }
         check_zombie();
+        #[cfg(target_os = "windows")]
+        crate::platform::windows::write_direct_host_status("server_initializing");
         let server = new_server();
+        #[cfg(target_os = "windows")]
+        crate::platform::windows::write_direct_host_status("server_ready");
         if config::option2bool("stop-service", &Config::get_option("stop-service")) {
             crate::test_rendezvous_server();
         }
@@ -134,6 +140,8 @@ impl RendezvousMediator {
         tokio::spawn(async move {
             direct_server(server_cloned).await;
         });
+        #[cfg(target_os = "windows")]
+        crate::platform::windows::write_direct_host_status("listener_task_spawned");
         #[cfg(target_os = "android")]
         let start_lan_listening = true;
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -222,7 +230,7 @@ impl RendezvousMediator {
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
         };
 
-        let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
+        let mut timer = crate::app_interval(interval(crate::TIMER_OUT));
         const MIN_REG_TIMEOUT: i64 = 3_000;
         const MAX_REG_TIMEOUT: i64 = 30_000;
         let mut reg_timeout = MIN_REG_TIMEOUT;
@@ -287,7 +295,7 @@ impl RendezvousMediator {
                     // the whole register / fails / latency / UDP-rebind path until
                     // DEPLOY_RETRY_INTERVAL elapses, otherwise the loop spins every
                     // few seconds (log spam + misapplied network-recovery rebind)
-                    // until the operator runs `rustdesk --deploy`.
+                    // until the operator runs `hdobbydesk --deploy`.
                     if deploy_register_throttled().await {
                         continue;
                     }
@@ -363,7 +371,7 @@ impl RendezvousMediator {
                     }
                     Ok(register_pk_response::Result::NOT_DEPLOYED) => {
                         if !NEEDS_DEPLOY.load(Ordering::SeqCst) {
-                            log::warn!("Server requires deployment. Run `rustdesk --deploy --token <api_token>` on this device.");
+                            log::warn!("Server requires deployment. Run `hdobbydesk --deploy --token <api_token>` on this device.");
                         }
                         NEEDS_DEPLOY.store(true, Ordering::SeqCst);
                         // Clear key_confirmed so the UI reflects the truth: this device is
@@ -432,7 +440,7 @@ impl RendezvousMediator {
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
         };
-        let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
+        let mut timer = crate::app_interval(interval(crate::TIMER_OUT));
         let mut last_register_sent: Option<Instant> = None;
         let mut last_recv_msg = Instant::now();
         // we won't support connecting to multiple rendzvous servers any more, so we can use a global variable here.
@@ -529,6 +537,9 @@ impl RendezvousMediator {
         socket_addr_v6: bytes::Bytes,
         meta: ConnectionMeta,
     ) -> ResultType<()> {
+        if !crate::configured_relay_allowed(&relay_server) {
+            bail!("Relay is disabled or does not match your configured relay server");
+        }
         let peer_addr = AddrMangle::decode(&socket_addr);
         log::info!(
             "create_relay requested from {:?}, relay_server: {}, uuid: {}, secure: {}",
@@ -749,7 +760,7 @@ impl RendezvousMediator {
         // Throttle register_pk when the device is awaiting deployment: server
         // already told us we're not in its db; sending more often than every
         // DEPLOY_RETRY_INTERVAL ms is wasted traffic until the operator runs
-        // `rustdesk --deploy --token <api_token>`.
+        // `hdobbydesk --deploy --token <api_token>`.
         if NEEDS_DEPLOY.load(Ordering::SeqCst) {
             let mut last = LAST_NOT_DEPLOYED_REGISTER.lock().await;
             if let Some(t) = *last {
@@ -822,88 +833,202 @@ impl RendezvousMediator {
         Ok(())
     }
 
-    fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
-        let mut relay_server = Config::get_option("relay-server");
-        if relay_server.is_empty() {
-            relay_server = provided_by_rendezvous_server;
+    fn get_relay_server(&self, _provided_by_rendezvous_server: String) -> String {
+        let relay = Config::get_option("relay-server");
+        if crate::configured_relay_allowed(&relay) {
+            relay
+        } else {
+            String::new()
         }
-        if relay_server.is_empty() {
-            relay_server = crate::increase_port(&self.host, 1);
-        }
-        relay_server
     }
 }
 
-fn get_direct_port() -> i32 {
-    let mut port = Config::get_option("direct-access-port")
-        .parse::<i32>()
-        .unwrap_or(0);
-    if port <= 0 {
-        port = RENDEZVOUS_PORT + 2;
+fn get_direct_listener() -> Option<(Option<std::net::IpAddr>, u16)> {
+    hbb_common::direct_tls::listener_endpoint(
+        &Config::get_option(hbb_common::direct_tls::LISTEN_IP_OPTION),
+        &Config::get_option("direct-access-port"),
+    )
+    .ok()
+}
+
+fn direct_server_enabled() -> bool {
+    if option2bool(
+        OPTION_DIRECT_SERVER,
+        &Config::get_option(OPTION_DIRECT_SERVER),
+    ) {
+        return true;
     }
-    port
+    // An installed Windows host is started by LocalSystem, whose profile does
+    // not contain the UI user's options. The protected machine identity is the
+    // durable enable marker, so direct access survives reboot and service
+    // restart without copying user configuration into the service profile.
+    #[cfg(target_os = "windows")]
+    {
+        return crate::platform::windows::direct_tls_machine_enabled();
+    }
+    #[cfg(not(target_os = "windows"))]
+    false
 }
 
 async fn direct_server(server: ServerPtr) {
+    #[cfg(target_os = "windows")]
+    crate::platform::windows::write_direct_host_status("evaluating");
     let mut listener = None;
-    let mut port = 0;
+    let mut tls_config = None;
+    let mut identity_path = String::new();
+    let mut retry_delay = 1_u64;
+    const MAX_RETRY_DELAY: u64 = 30;
+    let next_retry_delay = |delay: u64| (delay.saturating_mul(2)).min(MAX_RETRY_DELAY);
+    // Keep admission bounded after TLS as well: a completed handshake is not
+    // application authorization. Idle login attempts must not create unlimited tasks.
+    let direct_connections = Arc::new(tokio::sync::Semaphore::new(16));
+    let mut active_listener = None;
     loop {
-        let disabled = !option2bool(
-            OPTION_DIRECT_SERVER,
-            &Config::get_option(OPTION_DIRECT_SERVER),
-        ) || option2bool("stop-service", &Config::get_option("stop-service"));
+        let selected_listener = get_direct_listener();
+        let disabled = selected_listener.is_none()
+            || !direct_server_enabled()
+            || option2bool("stop-service", &Config::get_option("stop-service"));
+        if disabled {
+            #[cfg(target_os = "windows")]
+            crate::platform::windows::write_direct_host_status("disabled");
+            retry_delay = 1;
+        }
         if !disabled && listener.is_none() {
-            port = get_direct_port();
-            match hbb_common::tcp::listen_any(port as _).await {
+            #[cfg(target_os = "windows")]
+            {
+                crate::platform::windows::write_direct_host_status("identity_preparing");
+                if let Err(err) = crate::platform::windows::prepare_direct_tls_identity() {
+                    log::error!("Persistent direct TLS identity is unavailable: {err}");
+                    sleep(retry_delay as _).await;
+                    retry_delay = next_retry_delay(retry_delay);
+                    continue;
+                }
+            }
+            identity_path = Config::get_option(hbb_common::direct_tls::IDENTITY_FILE_OPTION);
+            // Identity preparation is explicit. Never generate a new host identity in the
+            // listener or silently serve the old plaintext direct protocol.
+            if identity_path.is_empty() {
+                #[cfg(target_os = "windows")]
+                crate::platform::windows::write_direct_host_status("identity_path_empty");
+                sleep(retry_delay as _).await;
+                retry_delay = next_retry_delay(retry_delay);
+                continue;
+            }
+            let path = identity_path.clone();
+            #[cfg(target_os = "windows")]
+            crate::platform::windows::write_direct_host_status("identity_loading");
+            tls_config = match tokio::task::spawn_blocking(move || {
+                hbb_common::direct_tls::Identity::load(std::path::Path::new(&path))?.server_config()
+            })
+            .await
+            {
+                Ok(Ok(config)) => Some(config),
+                _ => {
+                    #[cfg(target_os = "windows")]
+                    crate::platform::windows::write_direct_host_status("identity_load_failed");
+                    log::error!("Direct TLS identity unavailable; direct listener remains closed");
+                    // Identity storage can be transiently unavailable while the service or
+                    // its protected directory is being updated. Retry without rotating it.
+                    sleep(retry_delay as _).await;
+                    retry_delay = next_retry_delay(retry_delay);
+                    continue;
+                }
+            };
+            let Some((ip, port)) = selected_listener else {
+                continue;
+            };
+            active_listener = selected_listener;
+            #[cfg(target_os = "windows")]
+            crate::platform::windows::write_direct_host_status("binding");
+            let bound = match ip {
+                Some(ip) => tokio::net::TcpListener::bind(std::net::SocketAddr::new(ip, port))
+                    .await
+                    .map_err(Into::into),
+                None => hbb_common::tcp::listen_any(port).await,
+            };
+            match bound {
                 Ok(l) => {
                     listener = Some(l);
-                    log::info!(
-                        "Direct server listening on: {:?}",
-                        listener.as_ref().map(|l| l.local_addr())
-                    );
+                    retry_delay = 1;
+                    #[cfg(target_os = "windows")]
+                    crate::platform::windows::write_direct_host_status("listening");
+                    log::info!("Direct server listening");
                 }
-                Err(err) => {
-                    // to-do: pass to ui
-                    log::error!(
-                        "Failed to start direct server on port: {}, error: {}",
-                        port,
-                        err
-                    );
-                    loop {
-                        if port != get_direct_port() {
-                            break;
-                        }
-                        sleep(1.).await;
-                    }
+                Err(_) => {
+                    #[cfg(target_os = "windows")]
+                    crate::platform::windows::write_direct_host_status("bind_failed");
+                    log::error!("Failed to start direct server");
+                    // Service replacement can leave the previous host holding the port for
+                    // a short time. A first-bind failure must not wedge the host until the
+                    // operator changes a setting or restarts Windows.
+                    sleep(retry_delay as _).await;
+                    retry_delay = next_retry_delay(retry_delay);
+                    continue;
                 }
             }
         }
         if let Some(l) = listener.as_mut() {
-            if disabled || port != get_direct_port() {
+            if disabled
+                || active_listener != selected_listener
+                || identity_path != Config::get_option(hbb_common::direct_tls::IDENTITY_FILE_OPTION)
+            {
                 log::info!("Exit direct access listen");
                 listener = None;
                 continue;
             }
-            if let Ok(Ok((stream, addr))) = hbb_common::timeout(1000, l.accept()).await {
+            let accepted = hbb_common::timeout(1000, l.accept()).await;
+            // A timeout is the normal configuration-refresh boundary. Starting another
+            // accept immediately avoids adding up to 100 ms to connections that arrive
+            // between polling windows. Retain the backoff only for actual listener errors.
+            if accepted.is_err() {
+                continue;
+            }
+            if let Ok(Ok((stream, addr))) = accepted {
                 stream.set_nodelay(true).ok();
-                log::info!("direct access from {}", addr);
+                log::info!("Direct connection accepted");
                 let local_addr = stream
                     .local_addr()
                     .unwrap_or(Config::get_any_listen_addr(true));
                 let server = server.clone();
+                let Some(config) = tls_config.clone() else {
+                    continue;
+                };
+                let Ok(permit) = direct_connections.clone().try_acquire_owned() else {
+                    continue;
+                };
                 tokio::spawn(async move {
+                    let stream = match hbb_common::direct_tls::accept_stream(
+                        stream,
+                        local_addr,
+                        config,
+                        CONNECT_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(stream) => stream,
+                        Err(_) => {
+                            log::debug!("Direct TLS handshake rejected");
+                            return;
+                        }
+                    };
                     allow_err!(
                         crate::server::create_tcp_connection(
                             server,
-                            hbb_common::Stream::from(stream, local_addr),
+                            stream,
                             addr,
-                            false,
+                            false, // TLS is established; skip the legacy ID-server key exchange.
                             ConnectionMeta::default(), // Direct connections don't have server-side user context.
                         )
                         .await
                     );
+                    drop(permit);
                 });
             } else {
+                // A real accept error can leave a listener unusable. Drop and rebind it;
+                // timeout errors returned above remain the normal refresh boundary.
+                #[cfg(target_os = "windows")]
+                crate::platform::windows::write_direct_host_status("accept_failed");
+                listener = None;
                 sleep(0.1).await;
             }
         } else {

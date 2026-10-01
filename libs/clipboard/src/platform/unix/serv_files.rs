@@ -93,13 +93,14 @@ impl ClipFiles {
         Ok(())
     }
 
-    fn build_file_list_pdu(&mut self) {
+    fn build_file_list_pdu(&mut self) -> Result<(), CliprdrError> {
         let mut data = BytesMut::with_capacity(4 + 592 * self.file_list.len());
         data.put_u32_le(self.file_list.len() as u32);
         for file in self.file_list.iter() {
-            data.put(file.as_bin().as_slice());
+            data.put(file.as_bin()?.as_slice());
         }
-        self.files_pdu = data.to_vec()
+        self.files_pdu = data.to_vec();
+        Ok(())
     }
 
     fn get_files_for_audit(&self, request: &FileContentsRequest) -> Option<ClipboardFile> {
@@ -134,7 +135,7 @@ impl ClipFiles {
         conn_id: i32,
         request: FileContentsRequest,
     ) -> Result<ClipboardFile, CliprdrError> {
-        let (file_idx, file_contents_resp) = match request {
+        let (_file_idx, file_contents_resp) = match request {
             FileContentsRequest::Size {
                 stream_id,
                 file_idx,
@@ -177,6 +178,12 @@ impl ClipFiles {
                 offset,
                 length,
             } => {
+                if length == 0 || length > super::BLOCK_SIZE as u64 {
+                    return Err(CliprdrError::InvalidRequest {
+                        description: "clipboard read length is outside the allowed block size"
+                            .to_owned(),
+                    });
+                }
                 log::debug!(
                     "file contents (range from {} length {}) request from conn: {}",
                     offset,
@@ -203,7 +210,7 @@ impl ClipFiles {
                     file.name
                 );
 
-                if offset > file.size {
+                if file.is_dir || offset > file.size {
                     log::error!("invalid reading offset requested from conn: {}", conn_id);
                     return Err(CliprdrError::InvalidRequest {
                         description: format!(
@@ -212,11 +219,7 @@ impl ClipFiles {
                         ),
                     });
                 }
-                let read_size = if offset + length > file.size {
-                    file.size - offset
-                } else {
-                    length
-                };
+                let read_size = length.min(file.size - offset);
 
                 let mut buf = vec![0u8; read_size as usize];
 
@@ -234,13 +237,8 @@ impl ClipFiles {
         };
 
         log::debug!("file contents sent to conn: {}", conn_id);
-        // hot reload next file
-        for next_file in self.file_list.iter_mut().skip(file_idx + 1) {
-            if !next_file.is_dir {
-                next_file.load_handle()?;
-                break;
-            }
-        }
+        // Open later selections only when requested. A missing later file must
+        // not invalidate the current file's successfully read response.
         Ok(file_contents_resp)
     }
 }
@@ -259,13 +257,20 @@ pub fn read_file_contents(
     n_position_high: i32,
     cb_requested: i32,
 ) -> Vec<Result<ClipboardFile, CliprdrError>> {
+    if list_index < 0
+        || (dw_flags == 0x2 && (cb_requested <= 0 || cb_requested as u32 > super::BLOCK_SIZE))
+    {
+        return vec![Err(CliprdrError::InvalidRequest {
+            description: "invalid clipboard file index or read length".to_owned(),
+        })];
+    }
     let fcr = if dw_flags == 0x1 {
         FileContentsRequest::Size {
             stream_id,
             file_idx: list_index as usize,
         }
     } else if dw_flags == 0x2 {
-        let offset = (n_position_high as u64) << 32 | n_position_low as u64;
+        let offset = (n_position_high as u32 as u64) << 32 | n_position_low as u32 as u64;
         let length = cb_requested as u64;
 
         FileContentsRequest::Range {
@@ -300,8 +305,14 @@ pub fn sync_files(files: &[String]) -> Result<(), CliprdrError> {
     {
         return Ok(());
     }
-    files_lock.sync_files(files, current)?;
-    Ok(files_lock.build_file_list_pdu())
+    let result = files_lock
+        .sync_files(files, current)
+        .and_then(|_| files_lock.build_file_list_pdu());
+    if result.is_err() {
+        // An invalid new copy must not keep serving the previous selection.
+        files_lock.clear();
+    }
+    result
 }
 
 pub fn get_file_list_pdu() -> Vec<u8> {
@@ -314,6 +325,7 @@ mod sig_test {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // Unique temp dir under the system temp dir; removed on drop (no dev-dep).
     struct TmpDir(PathBuf);
@@ -385,7 +397,28 @@ mod sig_test {
     }
 
     #[test]
+    fn invalid_new_copy_clears_previous_file_selection() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let tmp = TmpDir::new("invalid_copy");
+        fs::write(tmp.join("valid.txt"), b"previous selection").unwrap();
+        std::os::unix::fs::symlink(tmp.join("valid.txt"), tmp.join("link")).unwrap();
+        clear_files();
+        sync_files(&[path_str(&tmp.join("valid.txt"))]).unwrap();
+        assert!(!get_file_list_pdu().is_empty());
+        assert!(sync_files(&[path_str(&tmp.join("link"))]).is_err());
+        assert!(get_file_list_pdu().is_empty());
+        assert!(CLIP_FILES.lock().file_list.is_empty());
+        sync_files(&[path_str(&tmp.join("valid.txt"))]).unwrap();
+        let decoded =
+            super::super::FileDescription::parse_file_descriptors(get_file_list_pdu(), 1).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].name, PathBuf::from("valid.txt"));
+        clear_files();
+    }
+
+    #[test]
     fn recopy_after_edit_refreshes_cached_size() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
         let tmp = TmpDir::new("recopy");
         let file = tmp.join("doc.bin");
         fs::write(&file, b"v1").unwrap(); // 2 bytes
@@ -413,5 +446,75 @@ mod sig_test {
         }
 
         clear_files(); // leave the global clean for other tests
+    }
+
+    #[test]
+    fn rejects_invalid_file_read_lengths_before_allocation() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let tmp = TmpDir::new("read_bounds");
+        fs::write(tmp.join("source"), b"abc").unwrap();
+        clear_files();
+        sync_files(&[path_str(&tmp.join("source"))]).unwrap();
+        for length in [-1, 0, super::super::BLOCK_SIZE as i32 + 1] {
+            let response = read_file_contents(1, 1, 0, 2, 1, 0, length);
+            assert!(
+                matches!(response.last(), Some(Err(_))),
+                "accepted length {length}"
+            );
+        }
+        clear_files();
+    }
+
+    #[test]
+    fn file_read_offset_preserves_unsigned_low_word_above_two_gib() {
+        use std::io::{Seek, SeekFrom, Write};
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let tmp = TmpDir::new("large_offset");
+        let path = tmp.join("sparse");
+        let mut file = fs::File::create(&path).unwrap();
+        file.seek(SeekFrom::Start(0x8000_0000)).unwrap();
+        file.write_all(b"END").unwrap();
+        drop(file);
+        clear_files();
+        sync_files(&[path_str(&path)]).unwrap();
+        let response = read_file_contents(1, 1, 0, 2, i32::MIN, 0, 3);
+        assert!(
+            matches!(response.last(), Some(Ok(ClipboardFile::FileContentsResponse { requested_data, .. })) if requested_data == b"END")
+        );
+        clear_files();
+    }
+
+    #[test]
+    fn missing_later_file_does_not_discard_current_read() {
+        let tmp = TmpDir::new("later_missing");
+        fs::write(tmp.join("first"), b"abc").unwrap();
+        fs::write(tmp.join("later"), b"xyz").unwrap();
+        let paths = [path_str(&tmp.join("first")), path_str(&tmp.join("later"))];
+        let mut cache = ClipFiles::default();
+        cache.sync_files(&paths, fingerprint(&paths)).unwrap();
+        fs::remove_file(tmp.join("later")).unwrap();
+        let response = cache.serve_file_contents(
+            1,
+            FileContentsRequest::Range {
+                stream_id: 1,
+                file_idx: 0,
+                offset: 0,
+                length: 3,
+            },
+        );
+        assert!(
+            matches!(response, Ok(ClipboardFile::FileContentsResponse { requested_data, .. }) if requested_data == b"abc")
+        );
+        assert!(cache
+            .serve_file_contents(
+                1,
+                FileContentsRequest::Range {
+                    stream_id: 1,
+                    file_idx: 1,
+                    offset: 0,
+                    length: 3
+                }
+            )
+            .is_err());
     }
 }

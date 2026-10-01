@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:bot_toast/bot_toast.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:hdobby_input/windows_session_choice.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
 import 'package:flutter_hbb/consts.dart';
@@ -786,8 +787,9 @@ class _PasswordWidgetState extends State<PasswordWidget> {
   }
 }
 
-void wrongPasswordDialog(SessionID sessionId,
-    OverlayDialogManager dialogManager, type, title, text) {
+void wrongPasswordDialog(
+    SessionID sessionId, OverlayDialogManager dialogManager, type, title, text,
+    {String peerId = ''}) {
   dialogManager.dismissAll();
   dialogManager.show((setState, close, context) {
     cancel() {
@@ -796,7 +798,7 @@ void wrongPasswordDialog(SessionID sessionId,
     }
 
     submit() {
-      enterPasswordDialog(sessionId, dialogManager);
+      enterPasswordDialog(sessionId, dialogManager, peerId: peerId);
     }
 
     return CustomAlertDialog(
@@ -819,11 +821,13 @@ void wrongPasswordDialog(SessionID sessionId,
 }
 
 void enterPasswordDialog(
-    SessionID sessionId, OverlayDialogManager dialogManager) async {
+    SessionID sessionId, OverlayDialogManager dialogManager,
+    {String peerId = ''}) async {
   await _connectDialog(
     sessionId,
     dialogManager,
     passwordController: TextEditingController(),
+    peerId: peerId,
   );
 }
 
@@ -846,7 +850,8 @@ void enterUserLoginAndPasswordDialog(
     SessionID sessionId,
     OverlayDialogManager dialogManager,
     String osAccountDescTip,
-    bool canRememberAccount) async {
+    bool canRememberAccount,
+    {String peerId = ''}) async {
   await _connectDialog(
     sessionId,
     dialogManager,
@@ -855,6 +860,7 @@ void enterUserLoginAndPasswordDialog(
     passwordController: TextEditingController(),
     osAccountDescTip: osAccountDescTip,
     canRememberAccount: canRememberAccount,
+    peerId: peerId,
   );
 }
 
@@ -866,12 +872,28 @@ _connectDialog(
   TextEditingController? passwordController,
   String? osAccountDescTip,
   bool canRememberAccount = true,
+  String peerId = '',
 }) async {
   final errUsername = ''.obs;
   var rememberPassword = false;
+  var directPairing = false;
   if (passwordController != null) {
-    rememberPassword =
+    final alreadyRemembered =
         await bind.sessionGetRemember(sessionId: sessionId) ?? false;
+    if (peerId.isNotEmpty) {
+      try {
+        directPairing =
+            (await bind.mainGetDirectTlsPairing(peer: peerId)).isNotEmpty;
+      } catch (_) {
+        directPairing = false;
+      }
+    }
+    final preference = directPairing
+        ? await bind.sessionGetPeerOption(
+            sessionId: sessionId, name: 'hdobby-direct-remember-password')
+        : '';
+    rememberPassword =
+        alreadyRemembered || (directPairing && preference.toUpperCase() != 'N');
   }
   var rememberAccount = false;
   if (canRememberAccount && osUsernameController != null) {
@@ -905,6 +927,12 @@ _connectDialog(
       final osPassword = osPasswordController?.text.trim() ?? '';
       final password = passwordController?.text.trim() ?? '';
       if (passwordController != null && password.isEmpty) return;
+      if (directPairing) {
+        bind.sessionPeerOption(
+            sessionId: sessionId,
+            name: 'hdobby-direct-remember-password',
+            value: rememberPassword ? 'Y' : 'N');
+      }
       if (rememberAccount) {
         bind.sessionPeerOption(
             sessionId: sessionId, name: 'os-username', value: osUsername);
@@ -2331,6 +2359,9 @@ void enter2FaDialog(
 }
 
 // This dialog should not be dismissed, otherwise it will be black screen, have not reproduced this.
+const kSelectedWindowsSessionOption = 'hdobby-windows-session';
+const kSelectedWindowsSessionKindOption = 'hdobby-windows-session-kind';
+
 void showWindowsSessionsDialog(
     String type,
     String title,
@@ -2345,18 +2376,58 @@ void showWindowsSessionsDialog(
   } catch (e) {
     print(e);
   }
-  List<String> sids = [];
-  List<String> names = [];
+  final choices = <WindowsSessionChoice>[];
   for (var session in sessionsList) {
-    sids.add(session['sid']);
-    names.add(session['name']);
+    final sid = session['sid']?.toString() ?? '';
+    final name = session['name']?.toString() ?? '';
+    if (sid.isNotEmpty) {
+      choices.add(WindowsSessionChoice(sid: sid, name: name));
+    }
   }
-  String selectedUserValue = sids.first;
+  if (choices.isEmpty) return;
+  final saved = peerId.isEmpty
+      ? ''
+      : bind.mainGetPeerFlutterOptionSync(
+          id: peerId, k: kSelectedWindowsSessionOption);
+  final savedKind = peerId.isEmpty
+      ? ''
+      : bind.mainGetPeerFlutterOptionSync(
+          id: peerId, k: kSelectedWindowsSessionKindOption);
+  final automaticChoice =
+      findAutomaticWindowsSession(choices, saved, savedKind);
+  if (automaticChoice != null) {
+    bind.sessionSendSelectedSessionId(
+        sessionId: sessionId, sid: automaticChoice.sid);
+    if (peerId.isNotEmpty && automaticChoice.sid != saved) {
+      bind.mainSetPeerFlutterOptionSync(
+          id: peerId, k: kSelectedWindowsSessionOption, v: automaticChoice.sid);
+    }
+    return;
+  }
+  final initialChoice = chooseInitialWindowsSession(choices, saved);
+  String selectedUserValue = initialChoice.sid;
+  final names = choices
+      .map((choice) => choice.displayLabel(
+            physicalMonitorLabel: translate('Same as physical monitor'),
+            separateWindowsDesktopLabel: translate('Separate Windows desktop'),
+            separateRemoteDesktopLabel: translate('Separate remote desktop'),
+          ))
+      .toList();
   dialogManager.dismissAll();
   dialogManager.show((setState, close, context) {
     submit() {
       bind.sessionSendSelectedSessionId(
           sessionId: sessionId, sid: selectedUserValue);
+      if (peerId.isNotEmpty) {
+        bind.mainSetPeerFlutterOptionSync(
+            id: peerId, k: kSelectedWindowsSessionOption, v: selectedUserValue);
+        final chosen = choices.firstWhere(
+            (choice) => choice.sid == selectedUserValue);
+        bind.mainSetPeerFlutterOptionSync(
+            id: peerId,
+            k: kSelectedWindowsSessionKindOption,
+            v: chosen.kind.name);
+      }
       close();
     }
 
@@ -2366,13 +2437,22 @@ void showWindowsSessionsDialog(
         mainAxisSize: MainAxisSize.min,
         children: [
           msgboxContent(type, title, text).marginOnly(bottom: 12),
-          ComboBox(
-              keys: sids,
-              values: names,
-              initialKey: selectedUserValue,
-              onChanged: (value) {
-                selectedUserValue = value;
-              }),
+          Text(
+            translate(
+                'Choose Console to control what is shown on the physical monitor. RDP uses a separate Windows desktop and may not change the monitor.'),
+          ).marginOnly(bottom: 12),
+          for (var i = 0; i < choices.length; i++)
+            ListTile(
+              leading: Icon(choices[i].sid == selectedUserValue
+                  ? Icons.radio_button_checked
+                  : Icons.radio_button_unchecked),
+              title: Text(names[i]),
+              selected: choices[i].sid == selectedUserValue,
+              onTap: () {
+                selectedUserValue = choices[i].sid;
+                setState(() {});
+              },
+            ),
         ],
       ),
       actions: [

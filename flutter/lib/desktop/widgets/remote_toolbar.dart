@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:async';
+import 'package:flutter_hbb/hdobby/input_helper.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -806,6 +807,11 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       BuildContext context, _ToolbarEdge edge, bool isHorizontal) {
     final List<Widget> toolbarItems = [];
     toolbarItems.add(_PinMenu(state: widget.state));
+    toolbarItems.add(windowsSessionScopeIndicator(
+      context,
+      widget.ffi,
+      iconOnly: !isHorizontal,
+    ));
     toolbarItems.add(Obx(() {
       final privacyModeState = PrivacyModeState.find(widget.id);
       if ((privacyModeState.isEmpty ||
@@ -847,6 +853,11 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
     // Do not show keyboard for camera connection type.
     if (widget.ffi.connType == ConnType.defaultConn) {
       toolbarItems.add(_KeyboardMenu(id: widget.id, ffi: widget.ffi));
+      toolbarItems.add(IconButton(
+        tooltip: hdobbyInputHelperLabel(context),
+        icon: const Icon(Icons.edit_note),
+        onPressed: () => showHdobbyInputHelper(context, widget.ffi),
+      ));
     }
     toolbarItems.add(_ChatMenu(id: widget.id, ffi: widget.ffi));
     if (!isWeb) {
@@ -1433,7 +1444,7 @@ class ScreenAdjustor {
   }
 
   _getScreenInfoDesktop() async {
-    final v = await rustDeskWinManager.call(
+    final v = await hdobbyDeskWinManager.call(
         WindowType.Main, kWindowGetWindowInfo, '');
     return v.result;
   }
@@ -2062,13 +2073,23 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
     return _SubmenuButton(
       ffi: widget.ffi,
       menuChildren: <Widget>[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 300),
+                child: Text(
+                  translate('remote-resolution-multi-client-tip'),
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+            ),
             _OriginalResolutionMenuButton(context, showOriginalBtn),
             _FitLocalResolutionMenuButton(context, showFitLocalBtn),
             _customResolutionMenuButton(context, isVirtualDisplay),
             _menuDivider(showOriginalBtn, showFitLocalBtn, isVirtualDisplay),
           ] +
           _supportedResolutionMenuButtons(),
-      child: Text(translate("Resolution")),
+      child: Text(translate("Remote resolution")),
     );
   }
 
@@ -2352,6 +2373,8 @@ class _KeyboardMenu extends StatelessWidget {
               if ([kPeerPlatformWindows, kPeerPlatformMacOS, kPeerPlatformLinux]
                   .contains(pi.platform))
                 showMyCursor(),
+              if (pi.supportsCollaborativeCursor) collaborativeCursor(),
+              if (pi.supportsKeyboardGamepad) keyboardGamepad(),
               Divider(),
               ...toolbarToggles(),
               ...mouseSpeed(),
@@ -2511,6 +2534,14 @@ class _KeyboardMenu extends StatelessWidget {
                 final showMyCursor = await bind.sessionGetToggleOption(
                     sessionId: ffi.sessionId, arg: kOptionToggleShowMyCursor);
                 ffiModel.setShowMyCursor(showMyCursor ?? value);
+                final collaborativeCursor = await bind.sessionGetToggleOption(
+                    sessionId: ffi.sessionId,
+                    arg: kOptionToggleCollaborativeCursor);
+                ffiModel.setCollaborativeCursor(collaborativeCursor ?? false);
+                final keyboardGamepad = await bind.sessionGetToggleOption(
+                    sessionId: ffi.sessionId,
+                    arg: kOptionToggleKeyboardGamepad);
+                ffiModel.setKeyboardGamepad(keyboardGamepad ?? false);
               }
             : null,
         ffi: ffi,
@@ -2530,6 +2561,10 @@ class _KeyboardMenu extends StatelessWidget {
                       arg: kOptionToggleShowMyCursor) ??
                   value;
               ffiModel.setShowMyCursor(showMyCursor);
+              final collaborativeCursor = await bind.sessionGetToggleOption(
+                  sessionId: ffi.sessionId,
+                  arg: kOptionToggleCollaborativeCursor);
+              ffiModel.setCollaborativeCursor(collaborativeCursor ?? false);
 
               // Also set view only if showMyCursor is enabled and viewOnly is not enabled.
               if (showMyCursor && !ffiModel.viewOnly) {
@@ -2543,6 +2578,85 @@ class _KeyboardMenu extends StatelessWidget {
             ffi: ffi,
             child: Text(translate('Show my cursor')))
         .paddingOnly(left: 26.0);
+  }
+
+  collaborativeCursor() {
+    final ffiModel = ffi.ffiModel;
+    return Tooltip(
+      message: translate('collaborative-cursor-tip'),
+      child: CkbMenuButton(
+              value: ffiModel.collaborativeCursor,
+              onChanged: ffiModel.keyboard
+                  ? (value) async {
+                      if (value == null) return;
+                      await bind.sessionToggleOption(
+                          sessionId: ffi.sessionId,
+                          value: kOptionToggleCollaborativeCursor);
+                      final enabled = await bind.sessionGetToggleOption(
+                              sessionId: ffi.sessionId,
+                              arg: kOptionToggleCollaborativeCursor) ??
+                          value;
+                      ffiModel.setCollaborativeCursor(enabled);
+                      if (enabled && ffi.inputModel.relativeMouseMode.value) {
+                        ffi.inputModel.setRelativeMouseMode(false);
+                      }
+                      ffiModel.setViewOnly(
+                          id,
+                          await bind.sessionGetToggleOption(
+                                  sessionId: ffi.sessionId,
+                                  arg: kOptionToggleViewOnly) ??
+                              false);
+                      ffiModel.setShowMyCursor(
+                          await bind.sessionGetToggleOption(
+                                  sessionId: ffi.sessionId,
+                                  arg: kOptionToggleShowMyCursor) ??
+                              false);
+                    }
+                  : null,
+              ffi: ffi,
+              child: Text(translate('Collaborative cursor control')))
+          .paddingOnly(left: 26.0),
+    );
+  }
+
+  keyboardGamepad() {
+    final ffiModel = ffi.ffiModel;
+    final ready = pi.keyboardGamepadReady;
+    return Tooltip(
+      message: translate(
+          ready ? 'keyboard-gamepad-tip' : 'keyboard-gamepad-driver-tip'),
+      child: CkbMenuButton(
+              value: ffiModel.keyboardGamepad,
+              onChanged: ffiModel.keyboard && ready
+                  ? (value) async {
+                      if (value == null) return;
+                      if (value &&
+                          bind.sessionIsKeyboardModeSupported(
+                              sessionId: ffi.sessionId, mode: kKeyMapMode)) {
+                        await bind.sessionSetKeyboardMode(
+                            sessionId: ffi.sessionId, value: kKeyMapMode);
+                        await ffi.inputModel.updateKeyboardMode();
+                      }
+                      await bind.sessionToggleOption(
+                          sessionId: ffi.sessionId,
+                          value: kOptionToggleKeyboardGamepad);
+                      final enabled = await bind.sessionGetToggleOption(
+                              sessionId: ffi.sessionId,
+                              arg: kOptionToggleKeyboardGamepad) ??
+                          value;
+                      ffiModel.setKeyboardGamepad(enabled);
+                      ffiModel.setViewOnly(
+                          id,
+                          await bind.sessionGetToggleOption(
+                                  sessionId: ffi.sessionId,
+                                  arg: kOptionToggleViewOnly) ??
+                              false);
+                    }
+                  : null,
+              ffi: ffi,
+              child: Text(translate('Keyboard as gamepad')))
+          .paddingOnly(left: 26.0),
+    );
   }
 
   mobileActions() {

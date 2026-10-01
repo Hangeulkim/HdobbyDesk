@@ -29,6 +29,7 @@ use objc::{class, msg_send, sel, sel_impl};
 use scrap::{libc::c_void, quartz::ffi::*};
 use std::{
     collections::HashMap,
+    os::unix::fs::MetadataExt,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -45,7 +46,11 @@ static mut LATEST_SEED: i32 = 0;
 #[inline]
 fn get_update_temp_dir() -> PathBuf {
     let euid = unsafe { hbb_common::libc::geteuid() };
-    Path::new("/tmp").join(format!(".rustdeskupdate-{}", euid))
+    Path::new("/tmp").join(format!(
+        ".{}-update-{}",
+        crate::get_app_name().to_lowercase(),
+        euid
+    ))
 }
 
 #[inline]
@@ -118,7 +123,7 @@ pub fn is_can_screen_recording(prompt: bool) -> bool {
 
 // macOS >= 10.15
 // https://stackoverflow.com/questions/56597221/detecting-screen-recording-settings-on-macos-catalina/
-// remove just one app from all the permissions: tccutil reset All com.carriez.rustdesk
+// remove just one app from all the permissions: tccutil reset All com.carriez.hdobbydesk
 fn unsafe_is_can_screen_recording(prompt: bool) -> bool {
     // we got some report that we show no permission even after set it, so we try to use new api for screen recording check
     // the new api is only available on macOS >= 10.15, but on stackoverflow, some people said it works on >= 10.16 (crash on 10.15),
@@ -222,13 +227,31 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
         return false;
     };
 
+    let active_username = get_active_username();
+    let active_uid = get_active_userid().parse::<u32>().ok();
+    let config_file = hbb_common::config::Config::file();
+    let config2_file = hbb_common::config::Config2::file();
+    let Some(active_uid) = active_uid else {
+        log::error!("Cannot resolve the active user for service installation");
+        return false;
+    };
+    if active_username.is_empty()
+        || !service_config_source_is_safe(&config_file, active_uid)
+        || !service_config_source_is_safe(&config2_file, active_uid)
+    {
+        log::error!("Service installation requires private, user-owned configuration files");
+        return false;
+    }
+
     std::thread::spawn(move || {
         match std::process::Command::new("osascript")
             .arg("-e")
             .arg(install_script_body)
             .arg(daemon_plist_body)
             .arg(agent_plist_body)
-            .arg(&get_active_username())
+            .arg(active_username)
+            .arg(config_file)
+            .arg(config2_file)
             .status()
         {
             Err(e) => {
@@ -248,6 +271,16 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
         }
     });
     false
+}
+
+fn service_config_source_is_safe(path: &Path, active_uid: u32) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    metadata.file_type().is_file()
+        && metadata.uid() == active_uid
+        && metadata.mode() & 0o077 == 0
+        && metadata.nlink() == 1
 }
 
 fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync: bool) {
@@ -303,13 +336,17 @@ fn update_daemon_agent(agent_plist_file: String, update_source_dir: String, sync
 }
 
 fn correct_app_name(s: &str) -> String {
-    let mut s = s.to_owned();
-    if let Some(bundleid) = get_bundle_id() {
-        s = s.replace("com.carriez.rustdesk", &bundleid);
-    }
-    s = s.replace("rustdesk", &crate::get_app_name().to_lowercase());
-    s = s.replace("RustDesk", &crate::get_app_name());
-    s
+    let app_name = crate::get_app_name();
+    let full_name = crate::get_full_name();
+    let bundle_id = get_bundle_id().unwrap_or_else(|| full_name.to_lowercase());
+    correct_app_name_with(s, &app_name, &full_name, &bundle_id)
+}
+
+fn correct_app_name_with(s: &str, app_name: &str, full_name: &str, bundle_id: &str) -> String {
+    s.replace("__APP_FULL_NAME__", full_name)
+        .replace("__APP_BUNDLE_ID__", bundle_id)
+        .replace("__APP_NAME_LOWER__", &app_name.to_lowercase())
+        .replace("__APP_NAME__", app_name)
 }
 
 pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
@@ -737,8 +774,8 @@ pub fn start_os_service() {
     /* // mouse/keyboard works in prelogin now with launchctl asuser.
        // below can avoid multi-users logged in problem, but having its own below problem.
        // Not find a good way to start --cm without root privilege (affect file transfer).
-       // one way is to start with `launchctl asuser <uid> open -n -a /Applications/RustDesk.app/ --args --cm`,
-       // this way --cm is started with the user privilege, but we will have problem to start another RustDesk.app
+       // one way is to start with `launchctl asuser <uid> open -n -a /Applications/HdobbyDesk.app/ --args --cm`,
+       // this way --cm is started with the user privilege, but we will have problem to start another HdobbyDesk.app
        // with open in explorer.
         use std::sync::{
             atomic::{AtomicBool, Ordering},
@@ -835,7 +872,7 @@ pub fn update_me() -> ResultType<()> {
     );
 
     let cmd = std::env::current_exe()?;
-    // RustDesk.app/Contents/MacOS/RustDesk
+    // HdobbyDesk.app/Contents/MacOS/HdobbyDesk
     let app_dir = cmd
         .parent()
         .and_then(|p| p.parent())
@@ -931,7 +968,7 @@ pub fn extract_update_dmg(file: &str) {
 }
 
 fn extract_dmg(dmg_path: &str, target_dir: &str) -> ResultType<()> {
-    let mount_point = "/Volumes/RustDeskUpdate";
+    let mount_point = "/Volumes/HdobbyDeskUpdate";
     let target_path = Path::new(target_dir);
 
     if target_path.exists() {
@@ -1226,5 +1263,97 @@ fn get_bundle_id() -> Option<String> {
             .to_string_lossy()
             .to_string();
         Some(bundle_id_str)
+    }
+}
+
+#[cfg(test)]
+mod service_install_tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::{symlink, PermissionsExt},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn rendered(name: &str) -> String {
+        let source = PRIVILEGES_SCRIPTS_DIR
+            .get_file(name)
+            .and_then(|file| file.contents_utf8())
+            .expect("embedded service template");
+        correct_app_name_with(
+            source,
+            "HdobbyDesk",
+            "com.hdobby.HdobbyDesk",
+            "com.hdobby.hdobbydesk",
+        )
+    }
+
+    #[test]
+    fn service_templates_render_to_canonical_hdobby_names() {
+        for name in [
+            "install.scpt",
+            "uninstall.scpt",
+            "update.scpt",
+            "daemon.plist",
+            "agent.plist",
+        ] {
+            let output = rendered(name);
+            assert!(!output.contains("__APP_"), "placeholder remains in {name}");
+            assert!(
+                !output.contains("HdobbyDesk"),
+                "legacy name remains in {name}"
+            );
+            assert!(
+                !output.contains("hdobbydesk"),
+                "legacy name remains in {name}"
+            );
+        }
+
+        let daemon = rendered("daemon.plist");
+        assert!(daemon.contains("com.hdobby.HdobbyDesk_service"));
+        assert!(daemon.contains("com.hdobby.hdobbydesk"));
+        assert!(daemon.contains("/Applications/HdobbyDesk.app/Contents/MacOS/service"));
+        assert!(!daemon.contains("/bin/sh"));
+        assert!(!daemon.contains("/tmp/"));
+
+        let installer = rendered("install.scpt");
+        assert!(installer.contains("umask 077"));
+        assert!(installer.contains("-m 0600"));
+        assert!(installer.contains("/usr/bin/mktemp /Library/LaunchDaemons/"));
+        assert!(installer.contains("/bin/launchctl bootstrap system"));
+    }
+
+    #[test]
+    fn service_config_source_requires_private_owned_regular_single_link_file() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hdobbydesk-service-config-test-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("test directory");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private directory");
+        let path = root.join("config.toml");
+        fs::write(&path, b"test-only").expect("test config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private config");
+        let uid = unsafe { hbb_common::libc::geteuid() };
+        assert!(service_config_source_is_safe(&path, uid));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("shared config");
+        assert!(!service_config_source_is_safe(&path, uid));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private config");
+
+        let hardlink = root.join("hardlink.toml");
+        fs::hard_link(&path, &hardlink).expect("hard link");
+        assert!(!service_config_source_is_safe(&path, uid));
+        fs::remove_file(&hardlink).expect("remove hard link");
+
+        let link = root.join("link.toml");
+        symlink(&path, &link).expect("symbolic link");
+        assert!(!service_config_source_is_safe(&link, uid));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
