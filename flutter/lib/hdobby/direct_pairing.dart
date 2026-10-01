@@ -29,6 +29,13 @@ class HdobbyDirectPairingButton extends StatelessWidget {
           canHost: !isIOS && !bind.isOutgoingOnly(),
           languageCode: language,
           initialPeer: initialPeer,
+          hostSettings: isWindows && bind.mainIsInstalled()
+              ? HdobbyRdpHostSetting(
+                  korean: korean,
+                  read: () => bind.mainIsShareRdp(),
+                  write: (enabled) => bind.mainSetShareRdp(enable: enabled),
+                )
+              : null,
           onPrepare: () => bind.mainPrepareDirectTlsIdentity(),
           onPrepareHost: setup.prepare,
           onCheckHost: setup.check,

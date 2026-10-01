@@ -6,6 +6,7 @@ export 'soft_keyboard_edit.dart';
 export 'direct_connection_error.dart';
 export 'session_resilience.dart';
 export 'windows_session_choice.dart';
+export 'rdp_host_setting.dart';
 
 enum InputAction {
   leftClick,

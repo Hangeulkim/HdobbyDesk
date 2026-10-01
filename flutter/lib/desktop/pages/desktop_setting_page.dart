@@ -1,3 +1,4 @@
+import 'package:hdobby_input/hdobby_input.dart';
 import '../../hdobby/about.dart';
 import 'dart:async';
 import 'dart:convert';
@@ -1310,42 +1311,15 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
   }
 
   shareRdp(BuildContext context, bool enabled) {
-    onChanged(bool b) async {
-      await bind.mainSetShareRdp(enable: b);
-      setState(() {});
+    if (!(isWindows && bind.mainIsInstalled())) {
+      return const SizedBox.shrink();
     }
-
-    bool value = bind.mainIsShareRdp();
-    return Offstage(
-      offstage: !(isWindows && bind.mainIsInstalled()),
-      child: GestureDetector(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Checkbox(
-                          value: value,
-                          onChanged: enabled ? (_) => onChanged(!value) : null)
-                      .marginOnly(right: 5),
-                  Expanded(
-                    child: Text(translate('Control the separate RDP desktop'),
-                        style: TextStyle(
-                            color: disabledTextColor(context, enabled))),
-                  )
-                ],
-              ),
-              Text(
-                translate('windows-rdp-session-sharing-tip'),
-                style: TextStyle(
-                  fontSize: 12,
-                  color: disabledTextColor(context, enabled),
-                ),
-              ).marginOnly(left: 37, right: 8, bottom: 4),
-            ],
-          ).marginOnly(left: _kCheckBoxLeftMargin),
-          onTap: enabled ? () => onChanged(!value) : null),
-    );
+    return HdobbyRdpHostSetting(
+      enabled: enabled,
+      korean: hdobbyLanguage(context).split(RegExp('[-_]')).first == 'ko',
+      read: () => bind.mainIsShareRdp(),
+      write: (value) => bind.mainSetShareRdp(enable: value),
+    ).marginOnly(left: _kCheckBoxLeftMargin);
   }
 
   List<Widget> directIp(BuildContext context) {

@@ -21,6 +21,7 @@ class HdobbyDirectPairing extends StatefulWidget {
     this.onResolveHost,
     this.onStopHost,
     this.onConnect,
+    this.hostSettings,
   });
 
   final bool canHost;
@@ -37,6 +38,7 @@ class HdobbyDirectPairing extends StatefulWidget {
   final Future<void> Function(String check)? onResolveHost;
   final Future<void> Function()? onStopHost;
   final Future<void> Function(String peer)? onConnect;
+  final Widget? hostSettings;
 
   @override
   State<HdobbyDirectPairing> createState() => _HdobbyDirectPairingState();
@@ -306,6 +308,7 @@ class _HdobbyDirectPairingState extends State<HdobbyDirectPairing>
                     const SizedBox(height: 18),
                     Text(t('이 기기를 호스트로', 'Use this device as a host'),
                         style: Theme.of(context).textTheme.titleMedium),
+                    if (widget.hostSettings != null) widget.hostSettings!,
                     Text(t(
                         '연결 준비를 누르면 인증서를 준비합니다. 서비스 준비 기능이 있는 경우 연결 대기를 시작하고 필요한 권한을 요청합니다.',
                         'Prepare the certificate here. When host setup is available, this also starts listening and requests required access.')),
