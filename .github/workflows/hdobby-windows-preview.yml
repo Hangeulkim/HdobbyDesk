@@ -24,8 +24,8 @@ jobs:
       - shell: bash
         run: |
           git -C libs/hbb_common -c core.autocrlf=false -c core.eol=lf checkout-index --force --all
-          git show HEAD:patches/hbb-common-private-network.patch > "$RUNNER_TEMP/hbb-common.patch"
-          git -C libs/hbb_common apply "$RUNNER_TEMP/hbb-common.patch"
+          git show HEAD:patches/hbb-common-private-network.patch > patches/hbb-common-private-network.patch
+          python scripts/apply_private_network.py --apply
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: '1.81.0'
