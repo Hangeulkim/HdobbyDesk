@@ -73,7 +73,15 @@ jobs:
       - name: Apply matching Flutter UI patch
         shell: bash
         run: |
-          git -C "$FLUTTER_ROOT" apply "$GITHUB_WORKSPACE/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          patch="$GITHUB_WORKSPACE/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          if git -C "$FLUTTER_ROOT" apply --check "$patch"; then
+            git -C "$FLUTTER_ROOT" apply "$patch"
+          elif git -C "$FLUTTER_ROOT" apply --reverse --check "$patch"; then
+            echo 'Matching Flutter patch is already present in the tool cache.'
+          else
+            echo 'Flutter cache does not match the required patch.' >&2
+            exit 1
+          fi
           cd flutter
           flutter pub get
       - uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
