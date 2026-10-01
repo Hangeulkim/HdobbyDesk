@@ -53,11 +53,22 @@ jobs:
           vcpkgDirectory: C:\vcpkg
           vcpkgGitCommitId: 120deac3062162151622ca4860575a33844ba10b
           doNotCache: false
+      - uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c
+        id: native-cache
+        with:
+          path: C:\vcpkg\installed
+          key: hdobby-vcpkg-x64-${{ hashFiles('vcpkg.json', 'res/vcpkg/**') }}
       - name: Build native dependencies
         shell: bash
         env:
           VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
         run: '"$VCPKG_ROOT/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"'
+      - uses: actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        with:
+          path: C:\vcpkg\installed
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
       - name: Generate matching bindings
         shell: bash
         run: |
