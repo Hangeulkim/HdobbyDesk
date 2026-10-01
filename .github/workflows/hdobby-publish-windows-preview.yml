@@ -1,0 +1,77 @@
+name: Publish verified Windows preview
+on:
+  workflow_dispatch:
+    inputs:
+      verified_run:
+        description: Successful Windows package-check run
+        required: true
+        type: string
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERIFIED_RUN: ${{ inputs.verified_run }}
+    steps:
+      - name: Validate successful package check
+        run: |
+          gh api "repos/$GH_REPO/actions/runs/$VERIFIED_RUN" > verified-run.json
+          python3 - <<'PY'
+          import json
+          run = json.load(open('verified-run.json'))
+          assert run['conclusion'] == 'success'
+          assert run['path'] == '.github/workflows/hdobby-windows-package-check.yml'
+          assert run['head_repository']['full_name'] == 'Hangeulkim/HdobbyDesk'
+          PY
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: HdobbyDesk-windows-x64-final
+          path: package
+          run-id: ${{ inputs.verified_run }}
+          github-token: ${{ github.token }}
+      - name: Verify package integrity and absence of runtime configuration
+        run: |
+          cd package
+          sha256sum --check SHA256SUMS.txt
+          python3 - <<'PY'
+          import pathlib, zipfile
+          expected = {'LICENSE', 'SHA256SUMS.txt', 'HdobbyDesk-windows-x64-preview.zip', 'HdobbyDesk-windows-x64.exe'}
+          assert {p.name for p in pathlib.Path('.').iterdir()} == expected
+          with zipfile.ZipFile('HdobbyDesk-windows-x64-preview.zip') as archive:
+              names = archive.namelist()
+              assert 'hdobbydesk.exe' in names and 'libhdobbydesk.dll' in names
+              assert 'LICENSE' in names
+              for name in names:
+                  path = pathlib.PurePosixPath(name)
+                  assert not path.is_absolute() and '..' not in path.parts
+                  assert path.suffix.lower() not in {'.pem', '.p12', '.pfx', '.key', '.toml', '.log'}
+                  assert path.name.lower() not in {'config.json', '.env', 'id_ed25519', 'id_rsa'}
+          PY
+      - name: Add Windows files to existing development preview
+        run: |
+          gh release download v0.1.0-preview.1 --pattern ARTIFACTS.json --pattern SHA256SUMS.txt --dir metadata
+          gh release view v0.1.0-preview.1 --json body > release.json
+          python3 - <<'PY'
+          import json, hashlib, pathlib
+          folder = pathlib.Path('package')
+          manifest = json.load(open('metadata/ARTIFACTS.json'))
+          for name in ('HdobbyDesk-windows-x64.exe', 'HdobbyDesk-windows-x64-preview.zip'):
+              path = folder / name
+              manifest['artifacts'][name] = {'bytes': path.stat().st_size, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'source_commit': 'c76f8dde6', 'package_check_run': int(__import__('os').environ['VERIFIED_RUN'])}
+          manifest['rdp_settings'] = 'Windows package includes host preparation settings. Pending local CM-hide and RDP-disconnect candidates are not included.'
+          manifest['windows_verification'] = 'Fresh MSVC/Flutter build; extracted ZIP and portable EXE startup and window-handle checks passed. Runner screenshots did not show the app; visual UI and live RDP-disconnect verification remain incomplete.'
+          pathlib.Path('metadata/ARTIFACTS.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2)+'\n')
+          pathlib.Path('metadata/SHA256SUMS.txt').write_text(''.join(f"{item['sha256']}  {name}\n" for name,item in sorted(manifest['artifacts'].items())))
+          body = json.load(open('release.json'))['body']
+          body = body.replace('- Windows 전체 설치 파일과 Intel Mac·iOS 패키지는 이번 릴리스에 포함하지 않습니다.', '- **Windows x64:** `HdobbyDesk-windows-x64.exe` 또는 폴더 전체를 풀어 실행하는 `HdobbyDesk-windows-x64-preview.zip`을 사용합니다. Intel Mac·iOS 패키지는 포함하지 않습니다.')
+          body = body.replace('새 Windows 설정 화면의 설치본 시험은 남아 있으며 다운로드 파일에 새 Windows UI가 포함된 것은 아닙니다.', 'Windows 다운로드 파일에는 새 호스트 준비 설정이 포함됩니다. 실제 PC의 모든 설정 전환 시험은 완료되지 않았습니다.')
+          body += '\n\nWindows 파일은 GitHub 빌드 환경에서 MSVC·Flutter로 새로 빌드했고 C++ 실행 라이브러리를 포함합니다. ZIP 압축 해제 실행과 단일 EXE의 자동 압축 해제·실행, 파일 해시를 확인했습니다. 빌드 서버 캡처에는 다른 창이 찍혀 화면 표시 정상은 미확인입니다. RDP 종료 시 세션 유지와 권한 창 닫기 숨김 수정은 아직 이 배포본에 포함되지 않습니다. V3 등 보안 제품의 평판 허용 여부는 각 제품에서 결정합니다.\n'
+          pathlib.Path('metadata/notes.md').write_text(body)
+          PY
+          gh release upload v0.1.0-preview.1 package/HdobbyDesk-windows-x64.exe package/HdobbyDesk-windows-x64-preview.zip metadata/ARTIFACTS.json metadata/SHA256SUMS.txt --clobber
+          gh release edit v0.1.0-preview.1 --notes-file metadata/notes.md
