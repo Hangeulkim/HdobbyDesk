@@ -78,6 +78,12 @@ jobs:
       - name: Build complete application
         shell: bash
         run: python build.py --portable --flutter --hwcodec --skip-portable-pack
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: HdobbyDesk-windows-x64-built-bundle
+          path: flutter/build/windows/x64/runner/Release/
+          if-no-files-found: error
+          retention-days: 14
       - name: Verify and package complete application
         shell: pwsh
         run: |
@@ -95,7 +101,7 @@ jobs:
             if (!$probe.HasExited) { Stop-Process -Id $probe.Id }
           }
           New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item LICENSE dist/LICENSE
+          Copy-Item LICENCE dist/LICENSE
           Compress-Archive -Path "$bundle/*" -DestinationPath dist/HdobbyDesk-windows-x64-preview.zip
           python -m pip install brotli==1.1.0
           python libs/portable/generate.py -f "$bundle" -o libs/portable -e "$bundle/hdobbydesk.exe" -l 6
