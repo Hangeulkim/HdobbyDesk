@@ -15,12 +15,17 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Preserve source line endings for the submodule patch
-        run: git config --global core.autocrlf false
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           submodules: recursive
       - shell: bash
-        run: git -C libs/hbb_common apply ../../patches/hbb-common-private-network.patch
+        run: |
+          git -C libs/hbb_common -c core.autocrlf=false -c core.eol=lf checkout-index --force --all
+          git show HEAD:patches/hbb-common-private-network.patch > "$RUNNER_TEMP/hbb-common.patch"
+          git -C libs/hbb_common apply "$RUNNER_TEMP/hbb-common.patch"
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: '1.81.0'
